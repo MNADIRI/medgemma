@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { uploadDicom } from "./api/client";
 import ChatPanel from "./components/ChatPanel";
 import DicomDropZone from "./components/DicomDropZone";
@@ -21,9 +21,24 @@ export default function App() {
   // Chat
   const { messages, isLoading, send, reset } = useChat(sessionId, selectedIndices);
 
+  // Prevent browser default file-open on drop ANYWHERE on the page
+  useEffect(() => {
+    const prevent = (e: DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    document.addEventListener("dragover", prevent);
+    document.addEventListener("drop", prevent);
+    return () => {
+      document.removeEventListener("dragover", prevent);
+      document.removeEventListener("drop", prevent);
+    };
+  }, []);
+
   const handleUpload = useCallback(async (files: File[]) => {
     setIsUploading(true);
     setUploadError(null);
+    console.log(`Uploading ${files.length} files:`, files.map((f) => f.name));
     try {
       const res = await uploadDicom(files);
       setSessionId(res.session_id);
@@ -33,7 +48,15 @@ export default function App() {
       setSelectedIndices(new Set());
       reset();
     } catch (err) {
-      setUploadError(err instanceof Error ? err.message : "Upload failed");
+      const msg = err instanceof Error ? err.message : "Upload failed";
+      console.error("Upload error:", msg);
+      if (msg === "Not Found" || msg === "Not Allowed") {
+        setUploadError(
+          "Cannot reach backend server. Make sure the backend is running on port 8000: python3 main.py"
+        );
+      } else {
+        setUploadError(msg);
+      }
     } finally {
       setIsUploading(false);
     }
@@ -105,7 +128,9 @@ export default function App() {
             <>
               <DicomDropZone onUpload={handleUpload} isUploading={isUploading} />
               {uploadError && (
-                <div style={{ color: "#e74c3c", fontSize: 14, padding: 8 }}>{uploadError}</div>
+                <div style={{ color: "#e74c3c", fontSize: 14, padding: 8, background: "#1a0000", borderRadius: 8, border: "1px solid #3a0000" }}>
+                  {uploadError}
+                </div>
               )}
             </>
           ) : (

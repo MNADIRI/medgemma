@@ -115,8 +115,9 @@ export default function DicomDropZone({ onUpload, isUploading }: Props) {
         id="file-input"
         type="file"
         multiple
-        // Accept everything — backend will filter
-        accept="*/*"
+        // @ts-expect-error webkitdirectory is non-standard but works in Chrome/Safari/Edge
+        webkitdirectory=""
+        directory=""
         style={{ display: "none" }}
         onChange={handleFileInput}
       />
