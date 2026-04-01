@@ -1,26 +1,7 @@
 import type { ChatMessage, ChatResponse, UploadResponse } from "../types";
 
-// In dev, Vite proxies /api -> localhost:8000. If proxy fails on large
-// uploads, fall back to calling the backend directly.
-const PROXY_BASE = "/api";
-const DIRECT_BASE = "http://localhost:8000/api";
-
-async function fetchWithFallback(
-  path: string,
-  init: RequestInit
-): Promise<Response> {
-  // Try through Vite proxy first
-  try {
-    const res = await fetch(`${PROXY_BASE}${path}`, init);
-    // 502 = proxy error → retry direct
-    if (res.status === 502) throw new Error("proxy 502");
-    return res;
-  } catch {
-    // Fallback: call backend directly (bypasses proxy)
-    console.warn("Proxy failed, calling backend directly");
-    return fetch(`${DIRECT_BASE}${path}`, init);
-  }
-}
+// Call backend directly — avoids Vite proxy issues with large uploads
+const BASE = "http://localhost:8000/api";
 
 export async function uploadDicom(files: File[]): Promise<UploadResponse> {
   const form = new FormData();
@@ -30,10 +11,10 @@ export async function uploadDicom(files: File[]): Promise<UploadResponse> {
 
   let res: Response;
   try {
-    res = await fetchWithFallback("/upload-dicom", { method: "POST", body: form });
+    res = await fetch(`${BASE}/upload-dicom`, { method: "POST", body: form });
   } catch (e) {
     throw new Error(
-      "Cannot connect to backend. Make sure the backend is running: python3 main.py"
+      "Cannot connect to backend. Make sure the backend is running: cd ~/medgemma/web/backend && python3 main.py"
     );
   }
 
@@ -58,7 +39,7 @@ export async function sendChat(
 ): Promise<ChatResponse> {
   let res: Response;
   try {
-    res = await fetchWithFallback("/chat", {
+    res = await fetch(`${BASE}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -70,7 +51,7 @@ export async function sendChat(
     });
   } catch (e) {
     throw new Error(
-      "Cannot connect to backend. Make sure the backend is running: python3 main.py"
+      "Cannot connect to backend. Make sure the backend is running: cd ~/medgemma/web/backend && python3 main.py"
     );
   }
 
@@ -88,9 +69,5 @@ export async function sendChat(
 }
 
 export function sliceUrl(sessionId: string, index: number): string {
-  return `${PROXY_BASE}/slices/${sessionId}/${index}`;
-}
-
-export function sliceUrlDirect(sessionId: string, index: number): string {
-  return `${DIRECT_BASE}/slices/${sessionId}/${index}`;
+  return `${BASE}/slices/${sessionId}/${index}`;
 }
