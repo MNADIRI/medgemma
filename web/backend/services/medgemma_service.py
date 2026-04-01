@@ -127,45 +127,24 @@ class MedGemmaService:
             self._load_for_high_ram()
 
     def _load_for_low_ram(self) -> None:
-        """Load model for ≤12 GB RAM systems. Avoids MPS to prevent OOM."""
-        # Strategy 1: Try int4 quantization (requires bitsandbytes + CUDA or CPU)
-        try:
-            from transformers import BitsAndBytesConfig
-            logger.info("Trying int4 quantization (bitsandbytes)…")
-            quant_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.float32,
-                bnb_4bit_quant_type="nf4",
-            )
-            self.model = transformers.AutoModelForImageTextToText.from_pretrained(
-                MODEL_ID,
-                quantization_config=quant_config,
-                device_map="auto",
-                trust_remote_code=True,
-            )
-            self.model.eval()
-            self.device = self.model.device
-            self._dtype = torch.float32
-            logger.info("Model loaded with int4 quantization on %s", self.device)
-            return
-        except Exception as e:
-            logger.warning("int4 quantization not available (%s)", e)
+        """Load model for ≤12 GB RAM systems (e.g. 8 GB Mac).
 
-        # Strategy 2: float32 on CPU with device_map="auto"
-        # On macOS, unified memory means CPU can use the same physical RAM as MPS
-        # but without the strict MPS allocation limits. macOS will swap if needed.
-        logger.info("Loading model in float32 on CPU (device_map=auto)…")
+        Loads in float16 directly on CPU — no MPS (OOM), no device_map
+        (causes unmapped-layer errors with quantization on Apple Silicon).
+        macOS unified memory + swap keeps it alive. Inference is slow
+        (~1-3 min) but stable.
+        """
+        logger.info("Low-RAM mode: loading model in float16 on CPU…")
         self.model = transformers.AutoModelForImageTextToText.from_pretrained(
             MODEL_ID,
-            torch_dtype=torch.float32,
-            device_map="auto",
+            torch_dtype=torch.float16,
             low_cpu_mem_usage=True,
             trust_remote_code=True,
         )
         self.model.eval()
         self.device = torch.device("cpu")
-        self._dtype = torch.float32
-        logger.info("Model loaded on CPU (float32, device_map=auto). Inference will be slow but stable.")
+        self._dtype = torch.float16
+        logger.info("Model loaded on CPU (float16). Inference will be slow but stable.")
 
     def _load_for_high_ram(self) -> None:
         """Load model for >12 GB RAM systems on MPS/CUDA."""

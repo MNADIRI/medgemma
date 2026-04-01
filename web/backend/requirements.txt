@@ -7,4 +7,3 @@ Pillow>=11.0
 torch>=2.3
 transformers @ git+https://github.com/huggingface/transformers.git
 accelerate>=0.30
-bitsandbytes>=0.43
