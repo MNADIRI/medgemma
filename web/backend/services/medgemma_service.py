@@ -92,12 +92,13 @@ class MedGemmaService:
 
         self.processor = transformers.AutoProcessor.from_pretrained(
             MODEL_ID,
-            use_fast=True,
+            trust_remote_code=True,
         )
         self.model = transformers.AutoModelForImageTextToText.from_pretrained(
             MODEL_ID,
             torch_dtype=dtype,
             device_map=device_map,
+            trust_remote_code=True,
         )
         self.device = self.model.device
         self._dtype = dtype
