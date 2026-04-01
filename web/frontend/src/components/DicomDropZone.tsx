@@ -5,6 +5,43 @@ interface Props {
   isUploading: boolean;
 }
 
+// Files to always skip (system / non-medical)
+const IGNORED_NAMES = new Set([
+  ".ds_store",
+  "thumbs.db",
+  "desktop.ini",
+  "._.ds_store",
+  "dicomdir",
+]);
+
+const IGNORED_EXTENSIONS = new Set([
+  ".txt",
+  ".json",
+  ".xml",
+  ".html",
+  ".css",
+  ".js",
+  ".md",
+  ".csv",
+  ".log",
+  ".py",
+  ".sh",
+  ".bat",
+  ".exe",
+  ".dll",
+  ".so",
+  ".dylib",
+]);
+
+function shouldIncludeFile(f: File): boolean {
+  const name = f.name.toLowerCase();
+  if (IGNORED_NAMES.has(name)) return false;
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".")) : "";
+  if (IGNORED_EXTENSIONS.has(ext)) return false;
+  // Accept everything else: .dcm, .DCM, .ima, .nii, .nii.gz, no extension, .zip, etc.
+  return true;
+}
+
 export default function DicomDropZone({ onUpload, isUploading }: Props) {
   const [isDragging, setIsDragging] = useState(false);
 
@@ -25,7 +62,7 @@ export default function DicomDropZone({ onUpload, isUploading }: Props) {
       const items = e.dataTransfer.items;
       const files: File[] = [];
 
-      // Collect files from drag (supports folder drops)
+      // Collect files from drag (supports folder drops via webkitGetAsEntry)
       const entries: FileSystemEntry[] = [];
       for (let i = 0; i < items.length; i++) {
         const entry = items[i].webkitGetAsEntry?.();
@@ -33,21 +70,16 @@ export default function DicomDropZone({ onUpload, isUploading }: Props) {
       }
 
       if (entries.length > 0) {
-        await collectFiles(entries, files);
+        await collectFilesRecursive(entries, files);
       } else {
-        // Fallback: just use the file list
         for (let i = 0; i < e.dataTransfer.files.length; i++) {
           files.push(e.dataTransfer.files[i]);
         }
       }
 
-      // Filter to .dcm files (or files without extension which are often DICOM)
-      const dicomFiles = files.filter(
-        (f) => f.name.endsWith(".dcm") || f.name.endsWith(".DCM") || !f.name.includes(".")
-      );
-
-      if (dicomFiles.length > 0) {
-        onUpload(dicomFiles);
+      const filtered = files.filter(shouldIncludeFile);
+      if (filtered.length > 0) {
+        onUpload(filtered);
       }
     },
     [onUpload]
@@ -56,8 +88,8 @@ export default function DicomDropZone({ onUpload, isUploading }: Props) {
   const handleFileInput = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
       if (e.target.files) {
-        const files = Array.from(e.target.files);
-        onUpload(files);
+        const files = Array.from(e.target.files).filter(shouldIncludeFile);
+        if (files.length > 0) onUpload(files);
       }
     },
     [onUpload]
@@ -83,19 +115,20 @@ export default function DicomDropZone({ onUpload, isUploading }: Props) {
         id="file-input"
         type="file"
         multiple
-        accept=".dcm,.DCM"
+        // Accept everything — backend will filter
+        accept="*/*"
         style={{ display: "none" }}
         onChange={handleFileInput}
       />
       {isUploading ? (
-        <p style={{ color: "#888", fontSize: 16 }}>Processing DICOM files...</p>
+        <p style={{ color: "#888", fontSize: 16 }}>Processing files...</p>
       ) : (
         <>
           <p style={{ color: "#ccc", fontSize: 18, margin: 0 }}>
-            Drop DICOM CT files or folder here
+            Drop DICOM files, folder, or ZIP here
           </p>
           <p style={{ color: "#666", fontSize: 14, marginTop: 8 }}>
-            or click to browse
+            .dcm, .ima, no extension, .zip — or click to browse
           </p>
         </>
       )}
@@ -103,7 +136,10 @@ export default function DicomDropZone({ onUpload, isUploading }: Props) {
   );
 }
 
-async function collectFiles(entries: FileSystemEntry[], result: File[]): Promise<void> {
+async function collectFilesRecursive(
+  entries: FileSystemEntry[],
+  result: File[]
+): Promise<void> {
   for (const entry of entries) {
     if (entry.isFile) {
       const file = await new Promise<File>((resolve) =>
@@ -111,11 +147,15 @@ async function collectFiles(entries: FileSystemEntry[], result: File[]): Promise
       );
       result.push(file);
     } else if (entry.isDirectory) {
+      // readEntries may not return all entries in one call — loop until empty
       const reader = (entry as FileSystemDirectoryEntry).createReader();
-      const children = await new Promise<FileSystemEntry[]>((resolve) =>
-        reader.readEntries(resolve)
-      );
-      await collectFiles(children, result);
+      let batch: FileSystemEntry[];
+      do {
+        batch = await new Promise<FileSystemEntry[]>((resolve) =>
+          reader.readEntries(resolve)
+        );
+        await collectFilesRecursive(batch, result);
+      } while (batch.length > 0);
     }
   }
 }

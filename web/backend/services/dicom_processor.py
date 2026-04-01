@@ -1,16 +1,19 @@
 """DICOM CT multi-slice processor.
 
-Reads DICOM files, sorts by slice position, applies MedGemma CT RGB windowing,
-and produces PIL Images ready for the model.
+Reads DICOM files (including from ZIP archives), sorts by slice position,
+applies MedGemma CT RGB windowing, and produces PIL Images ready for the model.
 """
 
 import io
-from pathlib import Path
+import logging
+import zipfile
 from typing import Any
 
 import numpy as np
 import PIL.Image
 import pydicom
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +69,53 @@ MEDGEMMA_CT_WINDOW = RGBWindow(
 
 
 # ---------------------------------------------------------------------------
+# ZIP extraction
+# ---------------------------------------------------------------------------
+
+# Files to skip inside ZIPs / uploads
+_SKIP_NAMES = {"dicomdir", ".ds_store", "thumbs.db", "desktop.ini"}
+_SKIP_EXTENSIONS = {
+    ".txt", ".json", ".xml", ".html", ".css", ".js", ".md",
+    ".csv", ".log", ".py", ".sh", ".bat", ".exe", ".dll",
+}
+
+
+def _should_skip(filename: str) -> bool:
+    name = filename.rsplit("/", 1)[-1].lower()
+    if name in _SKIP_NAMES or name.startswith("._"):
+        return True
+    ext = name[name.rfind("."):] if "." in name else ""
+    return ext in _SKIP_EXTENSIONS
+
+
+def _extract_files_from_uploads(
+    file_contents: list[tuple[str, bytes]],
+) -> list[tuple[str, bytes]]:
+    """Flatten uploads: extract ZIPs, skip junk files."""
+    result: list[tuple[str, bytes]] = []
+    for filename, raw in file_contents:
+        if _should_skip(filename):
+            continue
+        lower = filename.lower()
+        if lower.endswith(".zip"):
+            # Extract all files from ZIP
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                    for info in zf.infolist():
+                        if info.is_dir():
+                            continue
+                        inner_name = info.filename
+                        if _should_skip(inner_name):
+                            continue
+                        result.append((inner_name, zf.read(info)))
+            except zipfile.BadZipFile:
+                logger.warning("Skipping invalid ZIP: %s", filename)
+        else:
+            result.append((filename, raw))
+    return result
+
+
+# ---------------------------------------------------------------------------
 # DICOM processing
 # ---------------------------------------------------------------------------
 
@@ -96,6 +146,18 @@ def _rescale_to_hu(pixel_array: np.ndarray, dcm: pydicom.FileDataset) -> np.ndar
     return pixel_array.astype(np.float64)
 
 
+def _try_read_dicom(filename: str, raw: bytes) -> pydicom.FileDataset | None:
+    """Try to parse bytes as DICOM. Returns None on failure (silently skips)."""
+    try:
+        dcm = pydicom.dcmread(io.BytesIO(raw))
+        # Must have pixel data to be useful
+        _ = dcm.pixel_array
+        return dcm
+    except Exception:
+        logger.debug("Skipping non-DICOM file: %s", filename)
+        return None
+
+
 class ProcessedSlice:
     """A single processed CT slice."""
 
@@ -118,19 +180,37 @@ class CTDicomProcessor:
         self.window = MEDGEMMA_CT_WINDOW
 
     def process_files(self, file_contents: list[tuple[str, bytes]]) -> tuple[list[ProcessedSlice], dict[str, Any]]:
-        """Process uploaded DICOM file contents.
+        """Process uploaded file contents.
+
+        Handles: raw DICOM files (any extension), ZIP archives containing DICOMs,
+        folders with mixed content. Non-DICOM files are silently skipped.
 
         Args:
             file_contents: List of (filename, raw_bytes) tuples.
 
         Returns:
             (slices, series_metadata) – sorted processed slices and series-level metadata.
+
+        Raises:
+            ValueError: If no valid DICOM files are found.
         """
-        # Read all DICOM datasets
+        # Flatten ZIPs and filter junk
+        all_files = _extract_files_from_uploads(file_contents)
+
+        # Try to parse each file as DICOM (skip failures silently)
         datasets: list[tuple[str, pydicom.FileDataset]] = []
-        for filename, raw in file_contents:
-            dcm = pydicom.dcmread(io.BytesIO(raw))
-            datasets.append((filename, dcm))
+        for filename, raw in all_files:
+            dcm = _try_read_dicom(filename, raw)
+            if dcm is not None:
+                datasets.append((filename, dcm))
+
+        if not datasets:
+            raise ValueError(
+                "No valid DICOM files found. "
+                "Please upload .dcm files, a folder of DICOMs, or a ZIP archive."
+            )
+
+        logger.info("Found %d valid DICOM slices out of %d files", len(datasets), len(all_files))
 
         # Sort by slice position
         datasets.sort(key=lambda t: _slice_sort_key(t[1]))
