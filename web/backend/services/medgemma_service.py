@@ -118,7 +118,15 @@ class MedGemmaService:
         self._init_local()
 
     def _init_remote(self) -> None:
-        """Set up HuggingFace Inference API client. No model download."""
+        """Set up remote inference client.
+
+        Supports three configurations via env vars:
+          1. MEDGEMMA_ENDPOINT_URL  → HF Inference Endpoint (dedicated GPU)
+          2. MEDGEMMA_PROVIDER      → Third-party provider (e.g. novita, fireworks)
+          3. Neither                → HF serverless API (may not work for gated models)
+
+        All require HF_TOKEN.
+        """
         from huggingface_hub import InferenceClient
 
         token = os.environ.get("HF_TOKEN")
@@ -127,8 +135,30 @@ class MedGemmaService:
                 "HF_TOKEN environment variable is required for remote mode. "
                 "Get your token at https://huggingface.co/settings/tokens"
             )
-        self.hf_client = InferenceClient(model=MODEL_ID, token=token, timeout=120)
-        logger.info("Remote mode: connected to HF Inference API for %s", MODEL_ID)
+
+        endpoint_url = os.environ.get("MEDGEMMA_ENDPOINT_URL")
+        provider = os.environ.get("MEDGEMMA_PROVIDER")
+
+        if endpoint_url:
+            # Dedicated HF Inference Endpoint
+            self.hf_client = InferenceClient(
+                model=endpoint_url, token=token, timeout=120,
+            )
+            logger.info("Remote mode: using dedicated endpoint at %s", endpoint_url)
+        elif provider:
+            # Third-party provider (novita, fireworks, together, etc.)
+            self.hf_client = InferenceClient(
+                provider=provider, token=token, timeout=120,
+            )
+            logger.info("Remote mode: using provider '%s' for %s", provider, MODEL_ID)
+        else:
+            # Default: HF serverless API
+            self.hf_client = InferenceClient(
+                model=MODEL_ID, token=token, timeout=120,
+            )
+            logger.info("Remote mode: using HF serverless API for %s", MODEL_ID)
+
+        self._remote_model = MODEL_ID
 
     def _init_local(self) -> None:
         """Load model locally with RAM-aware strategy."""
@@ -323,10 +353,14 @@ class MedGemmaService:
             openai_messages.append({"role": msg["role"], "content": new_content})
 
         logger.info("Sending request to HF Inference API…")
-        output = self.hf_client.chat_completion(
-            messages=openai_messages,
-            max_tokens=MAX_NEW_TOKENS,
-        )
+        kwargs: dict[str, Any] = {
+            "messages": openai_messages,
+            "max_tokens": MAX_NEW_TOKENS,
+        }
+        # When using a provider (not a dedicated endpoint), pass model ID
+        if os.environ.get("MEDGEMMA_PROVIDER"):
+            kwargs["model"] = self._remote_model
+        output = self.hf_client.chat_completion(**kwargs)
 
         choice = output.choices[0]
         usage = output.usage
