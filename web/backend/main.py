@@ -59,7 +59,7 @@ if __name__ == "__main__":
         if path and methods:
             logger.info("Route: %s %s", methods, path)
 
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 8001))
     # Pass app object directly instead of string "main:app" to avoid
     # module re-import issues that can cause routes to go missing
     uvicorn.run(app, host="0.0.0.0", port=port)
