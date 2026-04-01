@@ -52,5 +52,14 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
 
+    # Log registered routes for debugging
+    for route in app.routes:
+        methods = getattr(route, "methods", None)
+        path = getattr(route, "path", None)
+        if path and methods:
+            logger.info("Route: %s %s", methods, path)
+
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    # Pass app object directly instead of string "main:app" to avoid
+    # module re-import issues that can cause routes to go missing
+    uvicorn.run(app, host="0.0.0.0", port=port)
