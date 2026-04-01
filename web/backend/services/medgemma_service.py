@@ -105,46 +105,36 @@ class MedGemmaService:
     def load_model(self) -> None:
         """Load MedGemma 1.5 4B. Call once at startup.
 
-        Strategy:
-        - ≤12 GB RAM  → int4 quantization (model ~2 GB) on CPU, fast enough
-        - >12 GB RAM  → float16 on MPS/CUDA (model ~8 GB)
-        Falls back gracefully on OOM.
+        Strategy for ≤12 GB RAM (e.g. 8 GB Mac):
+          1. Try int4 quantization via bitsandbytes (~2 GB) → fast
+          2. Fallback: float32 on CPU with device_map="auto" — macOS
+             unified memory + swap keeps it alive, slower but works.
+        For >12 GB RAM: float16 on MPS/CUDA.
         """
         logger.info("Loading MedGemma model %s …", MODEL_ID)
         ram_gb = _total_ram_gb()
-        force_quantize = os.environ.get("MEDGEMMA_QUANTIZE", "").lower() in ("1", "true", "yes")
-        use_quantization = force_quantize or ram_gb <= 12
-        logger.info("System RAM: %.1f GB — quantization %s", ram_gb, "ON (int4)" if use_quantization else "OFF (float16)")
-
-        # Determine device and dtype
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-            dtype = torch.float16
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = torch.device("mps")
-            dtype = torch.float16
-        else:
-            device = torch.device("cpu")
-            dtype = torch.float32
+        self._low_ram = ram_gb <= 12
+        logger.info("System RAM: %.1f GB — low_ram mode: %s", ram_gb, self._low_ram)
 
         self.processor = transformers.AutoProcessor.from_pretrained(
             MODEL_ID,
             trust_remote_code=True,
         )
 
-        if use_quantization:
-            self._load_quantized(device, dtype)
+        if self._low_ram:
+            self._load_for_low_ram()
         else:
-            self._load_full_precision(device, dtype)
+            self._load_for_high_ram()
 
-    def _load_quantized(self, device: torch.device, dtype: torch.dtype) -> None:
-        """Load model with int4 quantization — uses ~2 GB RAM."""
-        logger.info("Loading model with int4 quantization (bitsandbytes)…")
+    def _load_for_low_ram(self) -> None:
+        """Load model for ≤12 GB RAM systems. Avoids MPS to prevent OOM."""
+        # Strategy 1: Try int4 quantization (requires bitsandbytes + CUDA or CPU)
         try:
             from transformers import BitsAndBytesConfig
+            logger.info("Trying int4 quantization (bitsandbytes)…")
             quant_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_compute_dtype=torch.float32,
                 bnb_4bit_quant_type="nf4",
             )
             self.model = transformers.AutoModelForImageTextToText.from_pretrained(
@@ -155,16 +145,42 @@ class MedGemmaService:
             )
             self.model.eval()
             self.device = self.model.device
-            self._dtype = dtype
+            self._dtype = torch.float32
             logger.info("Model loaded with int4 quantization on %s", self.device)
+            return
         except Exception as e:
-            logger.warning("int4 quantization failed (%s), falling back to float16…", e)
-            self._load_full_precision(device, dtype)
+            logger.warning("int4 quantization not available (%s)", e)
 
-    def _load_full_precision(self, device: torch.device, dtype: torch.dtype) -> None:
-        """Load model in full float16 precision."""
+        # Strategy 2: float32 on CPU with device_map="auto"
+        # On macOS, unified memory means CPU can use the same physical RAM as MPS
+        # but without the strict MPS allocation limits. macOS will swap if needed.
+        logger.info("Loading model in float32 on CPU (device_map=auto)…")
+        self.model = transformers.AutoModelForImageTextToText.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.float32,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+        self.model.eval()
+        self.device = torch.device("cpu")
+        self._dtype = torch.float32
+        logger.info("Model loaded on CPU (float32, device_map=auto). Inference will be slow but stable.")
+
+    def _load_for_high_ram(self) -> None:
+        """Load model for >12 GB RAM systems on MPS/CUDA."""
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            dtype = torch.float16
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
+            dtype = torch.float16
+        else:
+            device = torch.device("cpu")
+            dtype = torch.float32
+
         try:
-            logger.info("Loading weights (trying direct load to %s)…", device)
+            logger.info("Loading weights to %s (dtype=%s)…", device, dtype)
             self.model = transformers.AutoModelForImageTextToText.from_pretrained(
                 MODEL_ID,
                 torch_dtype=dtype,
@@ -177,17 +193,8 @@ class MedGemmaService:
             self._dtype = dtype
             logger.info("Model loaded on %s (dtype=%s)", self.device, dtype)
         except (RuntimeError, torch.mps.OutOfMemoryError if hasattr(torch, "mps") else RuntimeError) as e:
-            logger.warning("Could not fit model on %s (%s). Using device_map=auto (slower).", device, e)
-            self.model = transformers.AutoModelForImageTextToText.from_pretrained(
-                MODEL_ID,
-                torch_dtype=dtype,
-                device_map="auto",
-                trust_remote_code=True,
-            )
-            self.model.eval()
-            self.device = self.model.device
-            self._dtype = dtype
-            logger.info("Model loaded with device_map=auto on %s (dtype=%s) — expect slower inference", self.device, dtype)
+            logger.warning("OOM on %s (%s), falling back to low-RAM strategy.", device, e)
+            self._load_for_low_ram()
 
     # ------------------------------------------------------------------
     # Chat
@@ -208,16 +215,17 @@ class MedGemmaService:
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
 
-        # Limit number of slices to avoid OOM on MPS
-        if len(selected_slices) > MAX_SLICES_PER_PROMPT:
+        # Limit number of slices to avoid OOM
+        max_slices = 3 if getattr(self, "_low_ram", False) else MAX_SLICES_PER_PROMPT
+        if len(selected_slices) > max_slices:
             logger.warning(
                 "Too many slices selected (%d), sampling %d uniformly",
-                len(selected_slices), MAX_SLICES_PER_PROMPT,
+                len(selected_slices), max_slices,
             )
-            step = len(selected_slices) / MAX_SLICES_PER_PROMPT
+            step = len(selected_slices) / max_slices
             selected_slices = [
                 selected_slices[int(i * step)]
-                for i in range(MAX_SLICES_PER_PROMPT)
+                for i in range(max_slices)
             ]
 
         # Build conversation messages
@@ -240,7 +248,7 @@ class MedGemmaService:
             )
 
             # Move to device
-            inputs = inputs.to(self.model.device, dtype=self._dtype)
+            inputs = inputs.to(self.model.device)
             input_len = inputs["input_ids"].shape[-1]
             logger.info("Input tokens: %d", input_len)
 
