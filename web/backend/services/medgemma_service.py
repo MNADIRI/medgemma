@@ -2,6 +2,10 @@
 
 Loads the model once at startup, caches processed PIL images per session,
 and constructs multi-slice conversations for each chat turn.
+
+Supports two backends (set via MEDGEMMA_BACKEND env var):
+  - "local"  : loads model locally (default)
+  - "remote" : uses HuggingFace Inference API (needs HF_TOKEN)
 """
 
 import base64
@@ -14,8 +18,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import PIL.Image
-import torch
-import transformers
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +25,7 @@ MODEL_ID = "google/medgemma-1.5-4b-it"
 MAX_NEW_TOKENS = 512
 # Max slices to send in a single prompt (memory safety for MPS/GPU)
 MAX_SLICES_PER_PROMPT = 10
+INFERENCE_BACKEND = os.environ.get("MEDGEMMA_BACKEND", "local").lower()
 
 def _total_ram_gb() -> float:
     """Return total system RAM in GB (works on macOS and Linux)."""
@@ -94,23 +97,44 @@ def _encode_pil_to_data_uri(img: PIL.Image.Image, fmt: str = "jpeg") -> str:
 # ---------------------------------------------------------------------------
 
 class MedGemmaService:
-    """Wraps HuggingFace model + processor for local inference."""
+    """Wraps HuggingFace model + processor for local or remote inference."""
 
     def __init__(self) -> None:
         self.model = None
         self.processor = None
         self.device = None
+        self.backend = INFERENCE_BACKEND  # "local" or "remote"
+        self.hf_client = None
         self.sessions = SessionManager()
 
     def load_model(self) -> None:
-        """Load MedGemma 1.5 4B. Call once at startup.
+        """Load model locally or connect to HF Inference API."""
+        logger.info("Backend mode: %s", self.backend)
 
-        Strategy for ≤12 GB RAM (e.g. 8 GB Mac):
-          1. Try int4 quantization via bitsandbytes (~2 GB) → fast
-          2. Fallback: float32 on CPU with device_map="auto" — macOS
-             unified memory + swap keeps it alive, slower but works.
-        For >12 GB RAM: float16 on MPS/CUDA.
-        """
+        if self.backend == "remote":
+            self._init_remote()
+            return
+
+        self._init_local()
+
+    def _init_remote(self) -> None:
+        """Set up HuggingFace Inference API client. No model download."""
+        from huggingface_hub import InferenceClient
+
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            raise RuntimeError(
+                "HF_TOKEN environment variable is required for remote mode. "
+                "Get your token at https://huggingface.co/settings/tokens"
+            )
+        self.hf_client = InferenceClient(model=MODEL_ID, token=token, timeout=120)
+        logger.info("Remote mode: connected to HF Inference API for %s", MODEL_ID)
+
+    def _init_local(self) -> None:
+        """Load model locally with RAM-aware strategy."""
+        import torch
+        import transformers
+
         logger.info("Loading MedGemma model %s …", MODEL_ID)
         ram_gb = _total_ram_gb()
         self._low_ram = ram_gb <= 12
@@ -134,6 +158,9 @@ class MedGemmaService:
         macOS unified memory + swap keeps it alive. Inference is slow
         (~1-3 min) but stable.
         """
+        import torch
+        import transformers
+
         logger.info("Low-RAM mode: loading model in float16 on CPU…")
         self.model = transformers.AutoModelForImageTextToText.from_pretrained(
             MODEL_ID,
@@ -148,6 +175,9 @@ class MedGemmaService:
 
     def _load_for_high_ram(self) -> None:
         """Load model for >12 GB RAM systems on MPS/CUDA."""
+        import torch
+        import transformers
+
         if torch.cuda.is_available():
             device = torch.device("cuda")
             dtype = torch.float16
@@ -194,7 +224,7 @@ class MedGemmaService:
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
 
-        # Limit number of slices to avoid OOM
+        # Limit number of slices to avoid OOM (local) or huge payloads (remote)
         max_slices = 3 if getattr(self, "_low_ram", False) else MAX_SLICES_PER_PROMPT
         if len(selected_slices) > max_slices:
             logger.warning(
@@ -207,53 +237,114 @@ class MedGemmaService:
                 for i in range(max_slices)
             ]
 
-        # Build conversation messages
-        messages = self._build_messages(session, user_message, selected_slices, history)
-
         logger.info(
-            "Chat: %d slices, %d history messages",
-            len(selected_slices), len(history),
+            "Chat (%s): %d slices, %d history messages",
+            self.backend, len(selected_slices), len(history),
         )
 
         try:
-            # Tokenise
-            inputs = self.processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                continue_final_message=False,
-                return_tensors="pt",
-                tokenize=True,
-                return_dict=True,
-            )
-
-            # Move to device
-            inputs = inputs.to(self.model.device)
-            input_len = inputs["input_ids"].shape[-1]
-            logger.info("Input tokens: %d", input_len)
-
-            # Generate
-            with torch.inference_mode():
-                output_ids = self.model.generate(
-                    **inputs,
-                    do_sample=False,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                )
-
-            # Decode only the new tokens
-            new_tokens = output_ids[0, input_len:]
-            response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
-            output_len = len(new_tokens)
-
-            return {
-                "response": response_text.strip(),
-                "usage": {
-                    "input_tokens": int(input_len),
-                    "output_tokens": int(output_len),
-                },
-            }
-        except Exception as e:
+            if self.backend == "remote":
+                return self._infer_remote(session, user_message, selected_slices, history)
+            return self._infer_local(session, user_message, selected_slices, history)
+        except Exception:
             logger.error("Inference failed:\n%s", traceback.format_exc())
             raise
+
+    # ------------------------------------------------------------------
+    # Inference backends
+    # ------------------------------------------------------------------
+
+    def _infer_local(
+        self,
+        session: SessionData,
+        user_message: str,
+        selected_slices: list[int],
+        history: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """Run inference using locally loaded model."""
+        import torch
+
+        messages = self._build_messages(session, user_message, selected_slices, history)
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            continue_final_message=False,
+            return_tensors="pt",
+            tokenize=True,
+            return_dict=True,
+        )
+
+        inputs = inputs.to(self.model.device)
+        input_len = inputs["input_ids"].shape[-1]
+        logger.info("Input tokens: %d", input_len)
+
+        with torch.inference_mode():
+            output_ids = self.model.generate(
+                **inputs,
+                do_sample=False,
+                max_new_tokens=MAX_NEW_TOKENS,
+            )
+
+        new_tokens = output_ids[0, input_len:]
+        response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
+        output_len = len(new_tokens)
+
+        return {
+            "response": response_text.strip(),
+            "usage": {
+                "input_tokens": int(input_len),
+                "output_tokens": int(output_len),
+            },
+        }
+
+    def _infer_remote(
+        self,
+        session: SessionData,
+        user_message: str,
+        selected_slices: list[int],
+        history: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """Run inference via HuggingFace Inference API."""
+        messages = self._build_messages(session, user_message, selected_slices, history)
+
+        # Convert to OpenAI-compatible format for HF Inference API
+        openai_messages = []
+        for msg in messages:
+            new_content = []
+            for block in msg["content"]:
+                if block.get("type") == "image":
+                    new_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": block["image"]},
+                    })
+                else:
+                    new_content.append(block)
+            openai_messages.append({"role": msg["role"], "content": new_content})
+
+        logger.info("Sending request to HF Inference API…")
+        output = self.hf_client.chat_completion(
+            messages=openai_messages,
+            max_tokens=MAX_NEW_TOKENS,
+        )
+
+        choice = output.choices[0]
+        usage = output.usage
+        response_text = choice.message.content or ""
+
+        logger.info(
+            "HF API response: %d input tokens, %d output tokens",
+            usage.prompt_tokens if usage else 0,
+            usage.completion_tokens if usage else 0,
+        )
+
+        return {
+            "response": response_text.strip(),
+            "usage": {
+                "input_tokens": usage.prompt_tokens if usage else None,
+                "output_tokens": usage.completion_tokens if usage else None,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Message construction

@@ -46,7 +46,8 @@ app.include_router(chat.router)
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "model_loaded": medgemma.model is not None}
+    ready = medgemma.model is not None or medgemma.hf_client is not None
+    return {"status": "ok", "backend": medgemma.backend, "model_loaded": ready}
 
 
 if __name__ == "__main__":
