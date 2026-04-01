@@ -84,26 +84,32 @@ class MedGemmaService:
 
         # Determine device and dtype
         if torch.cuda.is_available():
+            device = torch.device("cuda")
             dtype = torch.float16
-            device_map = "auto"
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = torch.device("mps")
             dtype = torch.float16
-            device_map = "auto"
         else:
+            device = torch.device("cpu")
             dtype = torch.float32
-            device_map = "cpu"
 
         self.processor = transformers.AutoProcessor.from_pretrained(
             MODEL_ID,
             trust_remote_code=True,
         )
+        # Load model to CPU first, then move to device explicitly.
+        # Using device_map="auto" on MPS causes disk offloading which
+        # makes inference extremely slow.
+        logger.info("Loading weights to CPU…")
         self.model = transformers.AutoModelForImageTextToText.from_pretrained(
             MODEL_ID,
             torch_dtype=dtype,
-            device_map=device_map,
             trust_remote_code=True,
         )
-        self.device = self.model.device
+        logger.info("Moving model to %s…", device)
+        self.model = self.model.to(device)
+        self.model.eval()
+        self.device = device
         self._dtype = dtype
         logger.info("Model loaded on %s (dtype=%s)", self.device, dtype)
 
