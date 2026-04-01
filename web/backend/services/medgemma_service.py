@@ -19,9 +19,9 @@ import transformers
 logger = logging.getLogger(__name__)
 
 MODEL_ID = "google/medgemma-1.5-4b-it"
-MAX_NEW_TOKENS = 2000
+MAX_NEW_TOKENS = 512
 # Max slices to send in a single prompt (memory safety for MPS/GPU)
-MAX_SLICES_PER_PROMPT = 20
+MAX_SLICES_PER_PROMPT = 10
 
 
 # ---------------------------------------------------------------------------
@@ -97,21 +97,35 @@ class MedGemmaService:
             MODEL_ID,
             trust_remote_code=True,
         )
-        # Load model to CPU first, then move to device explicitly.
-        # Using device_map="auto" on MPS causes disk offloading which
-        # makes inference extremely slow.
-        logger.info("Loading weights to CPU…")
-        self.model = transformers.AutoModelForImageTextToText.from_pretrained(
-            MODEL_ID,
-            torch_dtype=dtype,
-            trust_remote_code=True,
-        )
-        logger.info("Moving model to %s…", device)
-        self.model = self.model.to(device)
-        self.model.eval()
-        self.device = device
-        self._dtype = dtype
-        logger.info("Model loaded on %s (dtype=%s)", self.device, dtype)
+
+        # Try to load entirely on the target device.
+        # On Macs with low RAM (8GB), the model may not fit on MPS.
+        # In that case, fall back to device_map="auto" which offloads
+        # to disk — slower but functional.
+        try:
+            logger.info("Loading weights (trying direct load to %s)…", device)
+            self.model = transformers.AutoModelForImageTextToText.from_pretrained(
+                MODEL_ID,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            )
+            self.model = self.model.to(device)
+            self.model.eval()
+            self.device = device
+            self._dtype = dtype
+            logger.info("Model loaded on %s (dtype=%s)", self.device, dtype)
+        except (RuntimeError, torch.mps.OutOfMemoryError if hasattr(torch, "mps") else RuntimeError) as e:
+            logger.warning("Could not fit model on %s (%s). Using device_map=auto (slower).", device, e)
+            self.model = transformers.AutoModelForImageTextToText.from_pretrained(
+                MODEL_ID,
+                torch_dtype=dtype,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            self.device = self.model.device
+            self._dtype = dtype
+            logger.info("Model loaded with device_map=auto on %s (dtype=%s) — expect slower inference", self.device, dtype)
 
     # ------------------------------------------------------------------
     # Chat
