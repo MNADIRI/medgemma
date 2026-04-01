@@ -126,6 +126,13 @@ export default function ChatPanel({ messages, onSend, isLoading, disabled, selec
         <div ref={bottomRef} />
       </div>
 
+      {/* Slice count warning */}
+      {selectedCount > 20 && (
+        <div style={{ padding: "6px 12px", background: "#2a2000", color: "#f0c040", fontSize: 12, borderTop: "1px solid #333" }}>
+          {selectedCount} slices selected — the backend will sample 20 to fit in memory.
+        </div>
+      )}
+
       {/* Input */}
       <form
         onSubmit={handleSubmit}

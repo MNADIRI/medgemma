@@ -7,6 +7,7 @@ and constructs multi-slice conversations for each chat turn.
 import base64
 import io
 import logging
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID = "google/medgemma-1.5-4b-it"
 MAX_NEW_TOKENS = 2000
+# Max slices to send in a single prompt (memory safety for MPS/GPU)
+MAX_SLICES_PER_PROMPT = 20
 
 
 # ---------------------------------------------------------------------------
@@ -123,43 +126,65 @@ class MedGemmaService:
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
 
+        # Limit number of slices to avoid OOM on MPS
+        if len(selected_slices) > MAX_SLICES_PER_PROMPT:
+            logger.warning(
+                "Too many slices selected (%d), sampling %d uniformly",
+                len(selected_slices), MAX_SLICES_PER_PROMPT,
+            )
+            step = len(selected_slices) / MAX_SLICES_PER_PROMPT
+            selected_slices = [
+                selected_slices[int(i * step)]
+                for i in range(MAX_SLICES_PER_PROMPT)
+            ]
+
         # Build conversation messages
         messages = self._build_messages(session, user_message, selected_slices, history)
 
-        # Tokenise
-        inputs = self.processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            continue_final_message=False,
-            return_tensors="pt",
-            tokenize=True,
-            return_dict=True,
+        logger.info(
+            "Chat: %d slices, %d history messages",
+            len(selected_slices), len(history),
         )
 
-        # Move to device
-        inputs = inputs.to(self.model.device, dtype=self._dtype)
-        input_len = inputs["input_ids"].shape[-1]
-
-        # Generate
-        with torch.inference_mode():
-            output_ids = self.model.generate(
-                **inputs,
-                do_sample=False,
-                max_new_tokens=MAX_NEW_TOKENS,
+        try:
+            # Tokenise
+            inputs = self.processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                continue_final_message=False,
+                return_tensors="pt",
+                tokenize=True,
+                return_dict=True,
             )
 
-        # Decode only the new tokens
-        new_tokens = output_ids[0, input_len:]
-        response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
-        output_len = len(new_tokens)
+            # Move to device
+            inputs = inputs.to(self.model.device, dtype=self._dtype)
+            input_len = inputs["input_ids"].shape[-1]
+            logger.info("Input tokens: %d", input_len)
 
-        return {
-            "response": response_text.strip(),
-            "usage": {
-                "input_tokens": int(input_len),
-                "output_tokens": int(output_len),
-            },
-        }
+            # Generate
+            with torch.inference_mode():
+                output_ids = self.model.generate(
+                    **inputs,
+                    do_sample=False,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                )
+
+            # Decode only the new tokens
+            new_tokens = output_ids[0, input_len:]
+            response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
+            output_len = len(new_tokens)
+
+            return {
+                "response": response_text.strip(),
+                "usage": {
+                    "input_tokens": int(input_len),
+                    "output_tokens": int(output_len),
+                },
+            }
+        except Exception as e:
+            logger.error("Inference failed:\n%s", traceback.format_exc())
+            raise
 
     # ------------------------------------------------------------------
     # Message construction
@@ -176,12 +201,18 @@ class MedGemmaService:
 
         Format follows the notebook pattern:
           instruction, [image, "SLICE N"]*, query
+
+        All messages use the list-of-dicts content format for consistency
+        with the Gemma3 chat template.
         """
         messages: list[dict[str, Any]] = []
 
-        # Replay history (text-only for prior turns)
+        # Replay history using list content format for consistency
         for msg in history:
-            messages.append({"role": msg["role"], "content": msg["content"]})
+            messages.append({
+                "role": msg["role"],
+                "content": [{"type": "text", "text": msg["content"]}],
+            })
 
         # Current user turn: images + question
         content: list[dict[str, Any]] = []
