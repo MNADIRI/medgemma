@@ -7,6 +7,7 @@ and constructs multi-slice conversations for each chat turn.
 import base64
 import io
 import logging
+import os
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -22,6 +23,29 @@ MODEL_ID = "google/medgemma-1.5-4b-it"
 MAX_NEW_TOKENS = 512
 # Max slices to send in a single prompt (memory safety for MPS/GPU)
 MAX_SLICES_PER_PROMPT = 10
+
+def _total_ram_gb() -> float:
+    """Return total system RAM in GB (works on macOS and Linux)."""
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except ImportError:
+        pass
+    # Fallback: read from sysctl (macOS) or /proc/meminfo (Linux)
+    try:
+        import subprocess
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)
+        return int(out.strip()) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal"):
+                    return int(line.split()[1]) / (1024 ** 2)
+    except Exception:
+        pass
+    return 16.0  # assume enough RAM if we can't detect
 
 
 # ---------------------------------------------------------------------------
@@ -79,8 +103,18 @@ class MedGemmaService:
         self.sessions = SessionManager()
 
     def load_model(self) -> None:
-        """Load MedGemma 1.5 4B. Call once at startup."""
+        """Load MedGemma 1.5 4B. Call once at startup.
+
+        Strategy:
+        - ≤12 GB RAM  → int4 quantization (model ~2 GB) on CPU, fast enough
+        - >12 GB RAM  → float16 on MPS/CUDA (model ~8 GB)
+        Falls back gracefully on OOM.
+        """
         logger.info("Loading MedGemma model %s …", MODEL_ID)
+        ram_gb = _total_ram_gb()
+        force_quantize = os.environ.get("MEDGEMMA_QUANTIZE", "").lower() in ("1", "true", "yes")
+        use_quantization = force_quantize or ram_gb <= 12
+        logger.info("System RAM: %.1f GB — quantization %s", ram_gb, "ON (int4)" if use_quantization else "OFF (float16)")
 
         # Determine device and dtype
         if torch.cuda.is_available():
@@ -98,10 +132,37 @@ class MedGemmaService:
             trust_remote_code=True,
         )
 
-        # Try to load entirely on the target device.
-        # On Macs with low RAM (8GB), the model may not fit on MPS.
-        # In that case, fall back to device_map="auto" which offloads
-        # to disk — slower but functional.
+        if use_quantization:
+            self._load_quantized(device, dtype)
+        else:
+            self._load_full_precision(device, dtype)
+
+    def _load_quantized(self, device: torch.device, dtype: torch.dtype) -> None:
+        """Load model with int4 quantization — uses ~2 GB RAM."""
+        logger.info("Loading model with int4 quantization (bitsandbytes)…")
+        try:
+            from transformers import BitsAndBytesConfig
+            quant_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_quant_type="nf4",
+            )
+            self.model = transformers.AutoModelForImageTextToText.from_pretrained(
+                MODEL_ID,
+                quantization_config=quant_config,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+            self.model.eval()
+            self.device = self.model.device
+            self._dtype = dtype
+            logger.info("Model loaded with int4 quantization on %s", self.device)
+        except Exception as e:
+            logger.warning("int4 quantization failed (%s), falling back to float16…", e)
+            self._load_full_precision(device, dtype)
+
+    def _load_full_precision(self, device: torch.device, dtype: torch.dtype) -> None:
+        """Load model in full float16 precision."""
         try:
             logger.info("Loading weights (trying direct load to %s)…", device)
             self.model = transformers.AutoModelForImageTextToText.from_pretrained(
@@ -123,6 +184,7 @@ class MedGemmaService:
                 device_map="auto",
                 trust_remote_code=True,
             )
+            self.model.eval()
             self.device = self.model.device
             self._dtype = dtype
             logger.info("Model loaded with device_map=auto on %s (dtype=%s) — expect slower inference", self.device, dtype)
