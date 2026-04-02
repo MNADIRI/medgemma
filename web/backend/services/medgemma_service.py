@@ -210,13 +210,17 @@ class MedGemmaService:
 
         if torch.cuda.is_available():
             device = torch.device("cuda")
-            dtype = torch.float16
+            # MedGemma is trained in bfloat16 — use it directly.
+            # float16 conversion can corrupt weights (different value ranges).
+            # T4 emulates bf16 via float32 internally — slower but correct.
+            dtype = torch.bfloat16
         elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             device = torch.device("mps")
+            # MPS does not support bfloat16
             dtype = torch.float16
         else:
             device = torch.device("cpu")
-            dtype = torch.float32
+            dtype = torch.bfloat16
 
         try:
             logger.info("Loading weights to %s (dtype=%s)…", device, dtype)
