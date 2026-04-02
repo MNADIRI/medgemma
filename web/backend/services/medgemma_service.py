@@ -315,38 +315,15 @@ class MedGemmaService:
             return_tensors="pt",
         )
 
-        # Debug: log all input tensor shapes and dtypes
-        for k, v in inputs.items():
-            if hasattr(v, "shape"):
-                logger.info("  %s: shape=%s dtype=%s", k, v.shape, v.dtype)
-                # Log token_type_ids unique values (crucial for Gemma3 vision)
-                if k == "token_type_ids":
-                    unique_vals = v.unique().tolist()
-                    logger.info("  token_type_ids unique values: %s", unique_vals)
-                    # Count image-type tokens (type_id=1 means image in Gemma3)
-                    img_type_count = (v == 1).sum().item()
-                    logger.info("  token_type_ids: %d image tokens, %d text tokens", img_type_count, (v == 0).sum().item())
-
-        # Move to device — only cast float tensors to model dtype
-        device = self.model.device
-        model_dtype = self._dtype
-        moved = {}
-        for k, v in inputs.items():
-            if hasattr(v, "to"):
-                if v.is_floating_point():
-                    moved[k] = v.to(device, dtype=model_dtype)
-                else:
-                    moved[k] = v.to(device)
-            else:
-                moved[k] = v
-
-        input_len = moved["input_ids"].shape[-1]
+        # Move to model device — do NOT force dtype, let the model handle conversions
+        # (forcing float16 on pixel_values can cause degenerate output on some GPUs)
+        inputs = inputs.to(self.model.device)
+        input_len = inputs["input_ids"].shape[-1]
         logger.info("Input tokens: %d", input_len)
 
-        # Log first 10 output token IDs for debugging
         with torch.inference_mode():
             output_ids = self.model.generate(
-                **moved,
+                **inputs,
                 do_sample=False,
                 max_new_tokens=MAX_NEW_TOKENS,
             )
