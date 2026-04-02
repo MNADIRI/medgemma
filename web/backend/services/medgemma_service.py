@@ -297,16 +297,32 @@ class MedGemmaService:
         # Local processor expects PIL Image objects, not data URIs
         messages = self._build_messages(session, user_message, selected_slices, history, use_pil=True)
 
+        # Debug: log message structure
+        for msg in messages:
+            for block in msg.get("content", []):
+                if block.get("type") == "image":
+                    img = block.get("image")
+                    logger.info("Image block: type=%s, size=%s, mode=%s",
+                                type(img).__name__,
+                                getattr(img, "size", "N/A"),
+                                getattr(img, "mode", "N/A"))
+
         inputs = self.processor.apply_chat_template(
             messages,
             add_generation_prompt=True,
-            continue_final_message=False,
-            return_tensors="pt",
             tokenize=True,
             return_dict=True,
+            return_tensors="pt",
         )
 
-        inputs = inputs.to(self.model.device)
+        # Debug: log what keys are in inputs and pixel_values shape
+        logger.info("Input keys: %s", list(inputs.keys()))
+        if "pixel_values" in inputs:
+            logger.info("pixel_values shape: %s, dtype: %s", inputs["pixel_values"].shape, inputs["pixel_values"].dtype)
+        else:
+            logger.warning("NO pixel_values in inputs — images were not processed!")
+
+        inputs = inputs.to(self.model.device, dtype=self._dtype)
         input_len = inputs["input_ids"].shape[-1]
         logger.info("Input tokens: %d", input_len)
 
@@ -319,10 +335,13 @@ class MedGemmaService:
 
         new_tokens = output_ids[0, input_len:]
         response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
+        # Also decode WITHOUT skipping special tokens to see what's generated
+        raw_text = self.processor.decode(new_tokens, skip_special_tokens=False)
         output_len = len(new_tokens)
 
         logger.info("Output tokens: %d, response length: %d chars", output_len, len(response_text))
         logger.info("Response preview: %.200s", response_text.strip())
+        logger.info("Raw output preview (with special tokens): %.200s", raw_text[:200])
 
         return {
             "response": response_text.strip(),
