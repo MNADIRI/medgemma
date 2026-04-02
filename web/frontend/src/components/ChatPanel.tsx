@@ -127,9 +127,9 @@ export default function ChatPanel({ messages, onSend, isLoading, disabled, selec
       </div>
 
       {/* Slice count warning */}
-      {selectedCount > 3 && (
+      {selectedCount > 2 && (
         <div style={{ padding: "6px 12px", background: "#2a2000", color: "#f0c040", fontSize: 12, borderTop: "1px solid #333" }}>
-          {selectedCount} slices selected — the backend will sample up to 3 to fit in memory (8GB RAM). Select fewer slices for best results.
+          {selectedCount} slices selected — the backend will sample up to 2 to fit in GPU memory. Select fewer slices for best results.
         </div>
       )}
 

@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID = "google/medgemma-1.5-4b-it"
 MAX_NEW_TOKENS = 512
-# Max slices to send in a single prompt (memory safety for MPS/GPU)
-MAX_SLICES_PER_PROMPT = 10
+# Max slices per prompt — T4 (15GB) can handle ~2 in bfloat16
+MAX_SLICES_PER_PROMPT = 2
 INFERENCE_BACKEND = os.environ.get("MEDGEMMA_BACKEND", "local").lower()
 
 def _total_ram_gb() -> float:
@@ -83,6 +83,20 @@ class SessionManager:
 # ---------------------------------------------------------------------------
 # Image encoding helpers
 # ---------------------------------------------------------------------------
+
+def _clean_thinking_tokens(text: str) -> str:
+    """Remove MedGemma's internal thinking/reasoning blocks from output.
+
+    The model sometimes generates <unused94>thought...reasoning...</unused94>
+    blocks before or within the actual response. Strip them out.
+    """
+    import re
+    # Remove <unused94>thought ... </unused94> blocks (thinking tokens)
+    text = re.sub(r"<unused\d+>thought.*?(?:</unused\d+>|$)", "", text, flags=re.DOTALL)
+    # Remove any remaining <unused*> tags
+    text = re.sub(r"<unused\d+>", "", text)
+    return text.strip()
+
 
 def _encode_pil_to_data_uri(img: PIL.Image.Image, fmt: str = "jpeg") -> str:
     """Encode a PIL image as a base64 data URI."""
@@ -333,22 +347,13 @@ class MedGemmaService:
             )
 
         new_tokens = output_ids[0, input_len:]
-        first_10_ids = new_tokens[:10].tolist()
-        logger.info("First 10 output token IDs: %s", first_10_ids)
-
         response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
-        raw_text = self.processor.decode(new_tokens, skip_special_tokens=False)
         output_len = len(new_tokens)
 
+        # Clean up thinking/reasoning blocks that MedGemma sometimes generates
+        response_text = _clean_thinking_tokens(response_text)
+
         logger.info("Output tokens: %d, response length: %d chars", output_len, len(response_text))
-        if response_text.strip():
-            logger.info("Response preview: %.300s", response_text.strip())
-        else:
-            logger.warning("EMPTY response. Raw: %.200s", raw_text[:200])
-            # Try decoding full output (including input) to see if response is embedded differently
-            full_text = self.processor.decode(output_ids[0], skip_special_tokens=True)
-            logger.info("Full decoded output length: %d chars", len(full_text))
-            logger.info("Full output tail (last 200 chars): %.200s", full_text[-200:] if full_text else "(empty)")
 
         return {
             "response": response_text.strip(),
