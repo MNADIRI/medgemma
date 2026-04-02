@@ -1,8 +1,7 @@
 import type { ChatMessage, ChatResponse, UploadResponse } from "../types";
 
-// Call backend directly — avoids Vite proxy issues with large uploads
-// Change the port here if your backend runs on a different port
-const BASE = "http://localhost:8001/api";
+// Backend URL — defaults to localhost, override with VITE_BACKEND_URL for remote (e.g. Colab)
+const BASE = import.meta.env.VITE_BACKEND_URL || "http://localhost:8001/api";
 
 export async function uploadDicom(files: File[]): Promise<UploadResponse> {
   const form = new FormData();
