@@ -315,49 +315,59 @@ class MedGemmaService:
             return_tensors="pt",
         )
 
-        # Debug: log what keys are in inputs and pixel_values shape
-        logger.info("Input keys: %s", list(inputs.keys()))
-        if "pixel_values" in inputs:
-            logger.info("pixel_values shape: %s, dtype: %s", inputs["pixel_values"].shape, inputs["pixel_values"].dtype)
-        else:
-            logger.warning("NO pixel_values in inputs — images were not processed!")
+        # Debug: log all input tensor shapes and dtypes
+        for k, v in inputs.items():
+            if hasattr(v, "shape"):
+                logger.info("  %s: shape=%s dtype=%s", k, v.shape, v.dtype)
+                # Log token_type_ids unique values (crucial for Gemma3 vision)
+                if k == "token_type_ids":
+                    unique_vals = v.unique().tolist()
+                    logger.info("  token_type_ids unique values: %s", unique_vals)
+                    # Count image-type tokens (type_id=1 means image in Gemma3)
+                    img_type_count = (v == 1).sum().item()
+                    logger.info("  token_type_ids: %d image tokens, %d text tokens", img_type_count, (v == 0).sum().item())
 
-        # Move tensors to model device — cast only floating point tensors
+        # Move to device — only cast float tensors to model dtype
         device = self.model.device
         model_dtype = self._dtype
+        moved = {}
         for k, v in inputs.items():
             if hasattr(v, "to"):
                 if v.is_floating_point():
-                    inputs[k] = v.to(device, dtype=model_dtype)
+                    moved[k] = v.to(device, dtype=model_dtype)
                 else:
-                    inputs[k] = v.to(device)
-        input_len = inputs["input_ids"].shape[-1]
-        # Check for image placeholder tokens in input
-        input_ids = inputs["input_ids"][0].tolist()
-        # Gemma3 uses token_id 262144 for <image_soft_token> placeholder
-        image_token_count = sum(1 for t in input_ids if t >= 262000)
-        logger.info("Input tokens: %d (image placeholder tokens: %d)", input_len, image_token_count)
-        if image_token_count == 0:
-            logger.warning("No image placeholder tokens found! The processor may not have processed the image.")
-            # Log first 20 token IDs for debugging
-            logger.info("First 20 token IDs: %s", input_ids[:20])
+                    moved[k] = v.to(device)
+            else:
+                moved[k] = v
 
+        input_len = moved["input_ids"].shape[-1]
+        logger.info("Input tokens: %d", input_len)
+
+        # Log first 10 output token IDs for debugging
         with torch.inference_mode():
             output_ids = self.model.generate(
-                **inputs,
+                **moved,
                 do_sample=False,
                 max_new_tokens=MAX_NEW_TOKENS,
             )
 
         new_tokens = output_ids[0, input_len:]
+        first_10_ids = new_tokens[:10].tolist()
+        logger.info("First 10 output token IDs: %s", first_10_ids)
+
         response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
-        # Also decode WITHOUT skipping special tokens to see what's generated
         raw_text = self.processor.decode(new_tokens, skip_special_tokens=False)
         output_len = len(new_tokens)
 
         logger.info("Output tokens: %d, response length: %d chars", output_len, len(response_text))
-        logger.info("Response preview: %.200s", response_text.strip())
-        logger.info("Raw output preview (with special tokens): %.200s", raw_text[:200])
+        if response_text.strip():
+            logger.info("Response preview: %.300s", response_text.strip())
+        else:
+            logger.warning("EMPTY response. Raw: %.200s", raw_text[:200])
+            # Try decoding full output (including input) to see if response is embedded differently
+            full_text = self.processor.decode(output_ids[0], skip_special_tokens=True)
+            logger.info("Full decoded output length: %d chars", len(full_text))
+            logger.info("Full output tail (last 200 chars): %.200s", full_text[-200:] if full_text else "(empty)")
 
         return {
             "response": response_text.strip(),
