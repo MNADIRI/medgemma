@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatResponse, UploadResponse } from "../types";
+import type { ChatMessage, ChatResponse, ROI, UploadResponse } from "../types";
 
 // Backend URL — defaults to localhost, override with VITE_BACKEND_URL for remote (e.g. Colab)
 const BASE = import.meta.env.VITE_BACKEND_URL || "http://localhost:8001/api";
@@ -35,7 +35,8 @@ export async function sendChat(
   sessionId: string,
   message: string,
   selectedSlices: number[],
-  history: ChatMessage[]
+  history: ChatMessage[],
+  rois: Record<string, ROI> = {}
 ): Promise<ChatResponse> {
   let res: Response;
   try {
@@ -46,6 +47,7 @@ export async function sendChat(
         session_id: sessionId,
         message,
         selected_slices: selectedSlices,
+        rois,
         history,
       }),
     });

@@ -23,8 +23,9 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID = "google/medgemma-1.5-4b-it"
 MAX_NEW_TOKENS = 512
-# Max slices per prompt — T4 (15GB) can handle ~2 in bfloat16
-MAX_SLICES_PER_PROMPT = 2
+# Max *images* per prompt — T4 (15GB) can handle ~4 in bfloat16.
+# Each full slice = 1 image; each ROI crop = 1 additional image.
+MAX_IMAGES_PER_PROMPT = 4
 INFERENCE_BACKEND = os.environ.get("MEDGEMMA_BACKEND", "local").lower()
 
 def _total_ram_gb() -> float:
@@ -272,38 +273,72 @@ class MedGemmaService:
         session_id: str,
         user_message: str,
         selected_slices: list[int],
-        history: list[dict[str, str]],
+        rois: dict[int, dict] | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Run a chat turn with selected CT slices in context.
 
+        rois maps slice index → {x, y, width, height} in normalized 0-1 coords.
         Returns dict with 'response' and 'usage' keys.
         """
+        if rois is None:
+            rois = {}
+        if history is None:
+            history = []
+
         session = self.sessions.get(session_id)
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
 
-        # Limit number of slices to avoid OOM (local) or huge payloads (remote)
-        max_slices = 3 if getattr(self, "_low_ram", False) else MAX_SLICES_PER_PROMPT
-        if len(selected_slices) > max_slices:
+        # Budget: count total images (each slice = 1, each ROI = +1)
+        max_images = MAX_IMAGES_PER_PROMPT
+        total_images = len(selected_slices) + sum(
+            1 for idx in selected_slices if idx in rois
+        )
+
+        if total_images > max_images:
+            # Prioritize slices that have ROIs (user explicitly marked them)
+            with_roi = [s for s in selected_slices if s in rois]
+            without_roi = [s for s in selected_slices if s not in rois]
+
+            kept: list[int] = []
+            budget = max_images
+
+            # First, keep slices with ROIs (cost 2 each)
+            for s in with_roi:
+                if budget >= 2:
+                    kept.append(s)
+                    budget -= 2
+                else:
+                    break
+
+            # Fill remaining budget with non-ROI slices (cost 1 each)
+            for s in without_roi:
+                if budget >= 1:
+                    kept.append(s)
+                    budget -= 1
+                else:
+                    break
+
+            kept.sort()
             logger.warning(
-                "Too many slices selected (%d), sampling %d uniformly",
-                len(selected_slices), max_slices,
+                "Image budget exceeded (%d > %d), trimmed to %d slices (%d with ROIs)",
+                total_images, max_images, len(kept),
+                sum(1 for s in kept if s in rois),
             )
-            step = len(selected_slices) / max_slices
-            selected_slices = [
-                selected_slices[int(i * step)]
-                for i in range(max_slices)
-            ]
+            selected_slices = kept
+            # Remove ROIs for slices that were dropped
+            rois = {k: v for k, v in rois.items() if k in selected_slices}
 
         logger.info(
-            "Chat (%s): %d slices, %d history messages",
-            self.backend, len(selected_slices), len(history),
+            "Chat (%s): %d slices, %d ROIs, %d history messages",
+            self.backend, len(selected_slices), len(rois), len(history),
         )
 
         try:
             if self.backend == "remote":
-                return self._infer_remote(session, user_message, selected_slices, history)
-            return self._infer_local(session, user_message, selected_slices, history)
+                return self._infer_remote(session, user_message, selected_slices, rois, history)
+            return self._infer_local(session, user_message, selected_slices, rois, history)
         except Exception:
             logger.error("Inference failed:\n%s", traceback.format_exc())
             raise
@@ -317,12 +352,13 @@ class MedGemmaService:
         session: SessionData,
         user_message: str,
         selected_slices: list[int],
+        rois: dict[int, dict],
         history: list[dict[str, str]],
     ) -> dict[str, Any]:
         """Run inference using locally loaded model."""
         import torch
 
-        messages = self._build_messages(session, user_message, selected_slices, history, use_pil=True)
+        messages = self._build_messages(session, user_message, selected_slices, rois, history, use_pil=True)
 
         inputs = self.processor.apply_chat_template(
             messages,
@@ -367,10 +403,11 @@ class MedGemmaService:
         session: SessionData,
         user_message: str,
         selected_slices: list[int],
+        rois: dict[int, dict],
         history: list[dict[str, str]],
     ) -> dict[str, Any]:
         """Run inference via HuggingFace Inference API."""
-        messages = self._build_messages(session, user_message, selected_slices, history)
+        messages = self._build_messages(session, user_message, selected_slices, rois, history)
 
         # Convert to OpenAI-compatible format for HF Inference API
         openai_messages = []
@@ -423,16 +460,18 @@ class MedGemmaService:
         session: SessionData,
         user_message: str,
         selected_slices: list[int],
+        rois: dict[int, dict],
         history: list[dict[str, str]],
         use_pil: bool = False,
     ) -> list[dict[str, Any]]:
-        """Build the chat message list with interleaved slices.
+        """Build the chat message list with interleaved slices and ROI crops.
 
         Format follows the notebook pattern:
-          instruction, [image, "SLICE N"]*, query
+          instruction, [image, (roi_image)?, "SLICE N"]*, query
 
-        All messages use the list-of-dicts content format for consistency
-        with the Gemma3 chat template.
+        For slices with ROIs, both the full slice and the cropped region are
+        sent so SigLip encodes both at full resolution, giving the model a
+        zoomed-in view of the lesion alongside the full anatomical context.
 
         When use_pil=True (local inference), images are passed as PIL objects.
         When use_pil=False (remote inference), images are passed as data URIs.
@@ -455,18 +494,46 @@ class MedGemmaService:
             "The user has selected specific slices from a CT volume for your review. "
             "Each slice is labeled with its index number."
         )
+        if rois:
+            instruction += (
+                " Some slices include a cropped region of interest (ROI) that the "
+                "radiologist has highlighted for focused analysis. When an ROI is "
+                "provided, describe the lesion within it in detail and suggest a "
+                "differential diagnosis."
+            )
         content.append({"type": "text", "text": instruction})
+
+        def _append_image(img: PIL.Image.Image) -> None:
+            if use_pil:
+                content.append({"type": "image", "image": img})
+            else:
+                content.append({"type": "image", "image": _encode_pil_to_data_uri(img)})
 
         # Add selected slice images with SLICE N markers
         for slice_idx in selected_slices:
             if 0 <= slice_idx < len(session.images):
                 img = session.images[slice_idx]
-                if use_pil:
-                    content.append({"type": "image", "image": img})
+                _append_image(img)
+
+                roi = rois.get(slice_idx)
+                if roi:
+                    # Crop ROI from the model image (RGB windowed)
+                    w, h = img.size
+                    left = int(roi["x"] * w)
+                    top = int(roi["y"] * h)
+                    right = int((roi["x"] + roi["width"]) * w)
+                    bottom = int((roi["y"] + roi["height"]) * h)
+                    # Clamp to image bounds
+                    left, top = max(0, left), max(0, top)
+                    right, bottom = min(w, right), min(h, bottom)
+                    cropped = img.crop((left, top, right, bottom))
+                    _append_image(cropped)
+                    content.append({"type": "text", "text": (
+                        f"SLICE {slice_idx + 1} — full view above, "
+                        f"ROI detail above (region {left},{top} to {right},{bottom})"
+                    )})
                 else:
-                    data_uri = _encode_pil_to_data_uri(img)
-                    content.append({"type": "image", "image": data_uri})
-                content.append({"type": "text", "text": f"SLICE {slice_idx + 1}"})
+                    content.append({"type": "text", "text": f"SLICE {slice_idx + 1}"})
 
         # Add user question
         content.append({"type": "text", "text": f"\n\n{user_message}"})

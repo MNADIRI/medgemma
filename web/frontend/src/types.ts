@@ -25,6 +25,13 @@ export interface UploadResponse {
   metadata: SeriesMetadata;
 }
 
+export interface ROI {
+  x: number;      // normalized 0-1, left edge
+  y: number;      // normalized 0-1, top edge
+  width: number;  // normalized 0-1
+  height: number; // normalized 0-1
+}
+
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;

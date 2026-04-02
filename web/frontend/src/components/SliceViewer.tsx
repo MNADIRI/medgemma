@@ -1,16 +1,19 @@
 import React, { useCallback } from "react";
 import { sliceUrl } from "../api/client";
-import type { SliceInfo } from "../types";
+import type { ROI, SliceInfo } from "../types";
+import RoiCanvas from "./RoiCanvas";
 
 interface Props {
   sessionId: string;
   slices: SliceInfo[];
   currentIndex: number;
   selectedIndices: Set<number>;
+  roiMap: Map<number, ROI>;
   onCurrentChange: (index: number) => void;
   onToggleSelect: (index: number) => void;
   onSelectAll: () => void;
   onDeselectAll: () => void;
+  onSetRoi: (index: number, roi: ROI | null) => void;
 }
 
 export default function SliceViewer({
@@ -18,10 +21,12 @@ export default function SliceViewer({
   slices,
   currentIndex,
   selectedIndices,
+  roiMap,
   onCurrentChange,
   onToggleSelect,
   onSelectAll,
   onDeselectAll,
+  onSetRoi,
 }: Props) {
   const current = slices[currentIndex];
   const isSelected = selectedIndices.has(currentIndex);
@@ -50,6 +55,11 @@ export default function SliceViewer({
           alt={`Slice ${currentIndex + 1}`}
           style={{ width: "100%", display: "block", imageRendering: "auto" }}
         />
+        <RoiCanvas
+          currentRoi={roiMap.get(currentIndex) ?? null}
+          onRoiChange={(roi) => onSetRoi(currentIndex, roi)}
+          disabled={!isSelected}
+        />
         {/* Slice info overlay */}
         <div
           style={{
@@ -66,20 +76,33 @@ export default function SliceViewer({
           {current?.position != null && ` | z=${current.position.toFixed(1)}`}
         </div>
         {isSelected && (
-          <div
-            style={{
-              position: "absolute",
-              top: 8,
-              right: 8,
-              background: "#4a90d9",
-              color: "#fff",
-              padding: "2px 8px",
-              borderRadius: 4,
-              fontSize: 11,
-              fontWeight: 600,
-            }}
-          >
-            SELECTED
+          <div style={{ position: "absolute", top: 8, right: 8, display: "flex", gap: 4 }}>
+            {roiMap.has(currentIndex) && (
+              <div
+                style={{
+                  background: "#e67e22",
+                  color: "#fff",
+                  padding: "2px 8px",
+                  borderRadius: 4,
+                  fontSize: 11,
+                  fontWeight: 600,
+                }}
+              >
+                ROI
+              </div>
+            )}
+            <div
+              style={{
+                background: "#4a90d9",
+                color: "#fff",
+                padding: "2px 8px",
+                borderRadius: 4,
+                fontSize: 11,
+                fontWeight: 600,
+              }}
+            >
+              SELECTED
+            </div>
           </div>
         )}
       </div>
@@ -140,6 +163,7 @@ export default function SliceViewer({
         </button>
         <span style={{ color: "#888", fontSize: 12, marginLeft: "auto" }}>
           {selectedIndices.size} slice{selectedIndices.size !== 1 ? "s" : ""} selected
+          {roiMap.size > 0 && ` (${roiMap.size} ROI)`}
         </span>
       </div>
 
@@ -158,6 +182,7 @@ export default function SliceViewer({
             key={i}
             onClick={() => onCurrentChange(i)}
             style={{
+              position: "relative",
               minWidth: 6,
               height: 40,
               background: i === currentIndex ? "#4a90d9" : selectedIndices.has(i) ? "#2d6aa0" : "#333",
@@ -165,8 +190,23 @@ export default function SliceViewer({
               cursor: "pointer",
               border: selectedIndices.has(i) ? "1px solid #4a90d9" : "1px solid transparent",
             }}
-            title={`Slice ${i + 1}${selectedIndices.has(i) ? " (selected)" : ""}`}
-          />
+            title={`Slice ${i + 1}${selectedIndices.has(i) ? " (selected)" : ""}${roiMap.has(i) ? " (ROI)" : ""}`}
+          >
+            {roiMap.has(i) && (
+              <div
+                style={{
+                  position: "absolute",
+                  top: -2,
+                  right: -2,
+                  width: 6,
+                  height: 6,
+                  borderRadius: "50%",
+                  background: "#e67e22",
+                  border: "1px solid #111",
+                }}
+              />
+            )}
+          </div>
         ))}
       </div>
     </div>

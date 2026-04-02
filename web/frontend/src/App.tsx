@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { uploadDicom } from "./api/client";
 import ChatPanel from "./components/ChatPanel";
 import DicomDropZone from "./components/DicomDropZone";
 import SliceViewer from "./components/SliceViewer";
 import { useChat } from "./hooks/useChat";
-import type { SeriesMetadata, SliceInfo } from "./types";
+import type { ROI, SeriesMetadata, SliceInfo } from "./types";
 
 export default function App() {
   // Session state
@@ -17,9 +17,19 @@ export default function App() {
   // Viewer state
   const [currentIndex, setCurrentIndex] = useState(0);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
+  const [roiMap, setRoiMap] = useState<Map<number, ROI>>(new Map());
 
   // Chat
-  const { messages, isLoading, send, reset } = useChat(sessionId, selectedIndices);
+  const { messages, isLoading, send, reset } = useChat(sessionId, selectedIndices, roiMap);
+
+  // Total images for budget warning (each slice=1, each ROI=+1)
+  const totalImageCount = useMemo(() => {
+    let count = selectedIndices.size;
+    for (const idx of selectedIndices) {
+      if (roiMap.has(idx)) count++;
+    }
+    return count;
+  }, [selectedIndices, roiMap]);
 
   // Prevent browser default file-open on drop ANYWHERE on the page
   useEffect(() => {
@@ -46,6 +56,7 @@ export default function App() {
       setMetadata(res.metadata);
       setCurrentIndex(0);
       setSelectedIndices(new Set());
+      setRoiMap(new Map());
       reset();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Upload failed";
@@ -77,6 +88,15 @@ export default function App() {
 
   const handleDeselectAll = useCallback(() => {
     setSelectedIndices(new Set());
+  }, []);
+
+  const handleSetRoi = useCallback((index: number, roi: ROI | null) => {
+    setRoiMap((prev) => {
+      const next = new Map(prev);
+      if (roi) next.set(index, roi);
+      else next.delete(index);
+      return next;
+    });
   }, []);
 
   return (
@@ -140,10 +160,12 @@ export default function App() {
                 slices={slices}
                 currentIndex={currentIndex}
                 selectedIndices={selectedIndices}
+                roiMap={roiMap}
                 onCurrentChange={setCurrentIndex}
                 onToggleSelect={handleToggleSelect}
                 onSelectAll={handleSelectAll}
                 onDeselectAll={handleDeselectAll}
+                onSetRoi={handleSetRoi}
               />
               {/* Re-upload button */}
               <DicomDropZone onUpload={handleUpload} isUploading={isUploading} />
@@ -159,6 +181,7 @@ export default function App() {
             isLoading={isLoading}
             disabled={!sessionId}
             selectedCount={selectedIndices.size}
+            totalImageCount={totalImageCount}
           />
         </div>
       </div>

@@ -18,11 +18,15 @@ async def chat(request: Request, body: ChatRequest):
     if not body.selected_slices:
         raise HTTPException(400, "No slices selected. Select at least one slice.")
 
+    # Convert ROI string keys to int for the service layer
+    rois = {int(k): v.model_dump() for k, v in body.rois.items()} if body.rois else {}
+
     try:
         result = service.chat(
             session_id=body.session_id,
             user_message=body.message,
             selected_slices=body.selected_slices,
+            rois=rois,
             history=[m.model_dump() for m in body.history],
         )
     except Exception as exc:

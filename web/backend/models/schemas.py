@@ -43,10 +43,19 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class ROIRegion(BaseModel):
+    """Normalized ROI coordinates (0-1) relative to the image dimensions."""
+    x: float       # left edge
+    y: float       # top edge
+    width: float
+    height: float
+
+
 class ChatRequest(BaseModel):
     session_id: str
     message: str
     selected_slices: list[int]  # indices of slices to send to the model
+    rois: dict[str, ROIRegion] = {}  # key = slice index as string
     history: list[ChatMessage] = []
 
 

@@ -7,9 +7,10 @@ interface Props {
   isLoading: boolean;
   disabled: boolean;
   selectedCount: number;
+  totalImageCount: number;
 }
 
-export default function ChatPanel({ messages, onSend, isLoading, disabled, selectedCount }: Props) {
+export default function ChatPanel({ messages, onSend, isLoading, disabled, selectedCount, totalImageCount }: Props) {
   const [input, setInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -126,10 +127,10 @@ export default function ChatPanel({ messages, onSend, isLoading, disabled, selec
         <div ref={bottomRef} />
       </div>
 
-      {/* Slice count warning */}
-      {selectedCount > 2 && (
+      {/* Image budget warning */}
+      {totalImageCount > 4 && (
         <div style={{ padding: "6px 12px", background: "#2a2000", color: "#f0c040", fontSize: 12, borderTop: "1px solid #333" }}>
-          {selectedCount} slices selected — the backend will sample up to 2 to fit in GPU memory. Select fewer slices for best results.
+          {totalImageCount} images ({selectedCount} slices + ROIs) — exceeds GPU budget of 4. The backend will prioritize slices with ROIs.
         </div>
       )}
 

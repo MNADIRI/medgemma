@@ -1,8 +1,12 @@
 import { useCallback, useState } from "react";
 import { sendChat } from "../api/client";
-import type { ChatMessage } from "../types";
+import type { ChatMessage, ROI } from "../types";
 
-export function useChat(sessionId: string | null, selectedSlices: Set<number>) {
+export function useChat(
+  sessionId: string | null,
+  selectedSlices: Set<number>,
+  roiMap: Map<number, ROI>
+) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -15,16 +19,23 @@ export function useChat(sessionId: string | null, selectedSlices: Set<number>) {
       setMessages(updatedHistory);
       setIsLoading(true);
 
+      // Build ROIs payload: only include ROIs for selected slices
+      const sliceIndices = Array.from(selectedSlices).sort((a, b) => a - b);
+      const rois: Record<string, ROI> = {};
+      for (const idx of sliceIndices) {
+        const roi = roiMap.get(idx);
+        if (roi) rois[String(idx)] = roi;
+      }
+
       try {
         const res = await sendChat(
           sessionId,
           text,
-          Array.from(selectedSlices).sort((a, b) => a - b),
-          // Send prior history (without the current message, which is sent as `message`)
-          messages
+          sliceIndices,
+          messages,
+          rois
         );
 
-        console.log("Chat response:", JSON.stringify(res));
         const content = res.response || "(Empty response from model)";
         setMessages((prev) => [
           ...prev,
@@ -42,7 +53,7 @@ export function useChat(sessionId: string | null, selectedSlices: Set<number>) {
         setIsLoading(false);
       }
     },
-    [sessionId, selectedSlices, messages, isLoading]
+    [sessionId, selectedSlices, roiMap, messages, isLoading]
   );
 
   const reset = useCallback(() => {
