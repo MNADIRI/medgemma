@@ -294,7 +294,8 @@ class MedGemmaService:
         """Run inference using locally loaded model."""
         import torch
 
-        messages = self._build_messages(session, user_message, selected_slices, history)
+        # Local processor expects PIL Image objects, not data URIs
+        messages = self._build_messages(session, user_message, selected_slices, history, use_pil=True)
 
         inputs = self.processor.apply_chat_template(
             messages,
@@ -393,14 +394,18 @@ class MedGemmaService:
         user_message: str,
         selected_slices: list[int],
         history: list[dict[str, str]],
+        use_pil: bool = False,
     ) -> list[dict[str, Any]]:
-        """Build the HuggingFace chat message list with interleaved slices.
+        """Build the chat message list with interleaved slices.
 
         Format follows the notebook pattern:
           instruction, [image, "SLICE N"]*, query
 
         All messages use the list-of-dicts content format for consistency
         with the Gemma3 chat template.
+
+        When use_pil=True (local inference), images are passed as PIL objects.
+        When use_pil=False (remote inference), images are passed as data URIs.
         """
         messages: list[dict[str, Any]] = []
 
@@ -426,8 +431,11 @@ class MedGemmaService:
         for slice_idx in selected_slices:
             if 0 <= slice_idx < len(session.images):
                 img = session.images[slice_idx]
-                data_uri = _encode_pil_to_data_uri(img)
-                content.append({"type": "image", "image": data_uri})
+                if use_pil:
+                    content.append({"type": "image", "image": img})
+                else:
+                    data_uri = _encode_pil_to_data_uri(img)
+                    content.append({"type": "image", "image": data_uri})
                 content.append({"type": "text", "text": f"SLICE {slice_idx + 1}"})
 
         # Add user question
