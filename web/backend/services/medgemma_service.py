@@ -322,9 +322,25 @@ class MedGemmaService:
         else:
             logger.warning("NO pixel_values in inputs — images were not processed!")
 
-        inputs = inputs.to(self.model.device, dtype=self._dtype)
+        # Move tensors to model device — cast only floating point tensors
+        device = self.model.device
+        model_dtype = self._dtype
+        for k, v in inputs.items():
+            if hasattr(v, "to"):
+                if v.is_floating_point():
+                    inputs[k] = v.to(device, dtype=model_dtype)
+                else:
+                    inputs[k] = v.to(device)
         input_len = inputs["input_ids"].shape[-1]
-        logger.info("Input tokens: %d", input_len)
+        # Check for image placeholder tokens in input
+        input_ids = inputs["input_ids"][0].tolist()
+        # Gemma3 uses token_id 262144 for <image_soft_token> placeholder
+        image_token_count = sum(1 for t in input_ids if t >= 262000)
+        logger.info("Input tokens: %d (image placeholder tokens: %d)", input_len, image_token_count)
+        if image_token_count == 0:
+            logger.warning("No image placeholder tokens found! The processor may not have processed the image.")
+            # Log first 20 token IDs for debugging
+            logger.info("First 20 token IDs: %s", input_ids[:20])
 
         with torch.inference_mode():
             output_ids = self.model.generate(
