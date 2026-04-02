@@ -24,9 +24,11 @@ export function useChat(sessionId: string | null, selectedSlices: Set<number>) {
           messages
         );
 
+        console.log("Chat response:", JSON.stringify(res));
+        const content = res.response || "(Empty response from model)";
         setMessages((prev) => [
           ...prev,
-          { role: "assistant", content: res.response },
+          { role: "assistant", content },
         ]);
       } catch (err) {
         setMessages((prev) => [

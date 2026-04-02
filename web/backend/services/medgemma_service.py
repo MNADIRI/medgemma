@@ -320,6 +320,9 @@ class MedGemmaService:
         response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
         output_len = len(new_tokens)
 
+        logger.info("Output tokens: %d, response length: %d chars", output_len, len(response_text))
+        logger.info("Response preview: %.200s", response_text.strip())
+
         return {
             "response": response_text.strip(),
             "usage": {
