@@ -28,10 +28,11 @@ async def upload_dicom(request: Request, files: list[UploadFile]):
     except Exception as exc:
         raise HTTPException(422, f"Failed to process DICOM files: {exc}") from exc
 
-    # Store images in session via the MedGemma service
+    # Store both model images (RGB windowed) and display images (grayscale)
     service = request.app.state.medgemma
-    images = [s.image for s in slices]
-    session_id = service.sessions.create(images, meta)
+    model_images = [s.model_image for s in slices]
+    display_images = [s.display_image for s in slices]
+    session_id = service.sessions.create(model_images, meta, display_images=display_images)
 
     # Build response
     slice_infos = [
@@ -55,16 +56,16 @@ async def upload_dicom(request: Request, files: list[UploadFile]):
 
 @router.get("/slices/{session_id}/{index}")
 async def get_slice(request: Request, session_id: str, index: int):
-    """Return a JPEG preview of a single slice."""
+    """Return a JPEG preview of a single slice (grayscale for display)."""
     service = request.app.state.medgemma
     session = service.sessions.get(session_id)
     if session is None:
         raise HTTPException(404, "Session not found")
-    if index < 0 or index >= len(session.images):
+    if index < 0 or index >= len(session.display_images):
         raise HTTPException(404, "Slice index out of range")
 
-    img = session.images[index]
-    from services.dicom_processor import ProcessedSlice
-
-    ps = ProcessedSlice(index=index, position=0.0, image=img, metadata={})
-    return Response(content=ps.to_jpeg_bytes(), media_type="image/jpeg")
+    import io
+    img = session.display_images[index]
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=90)
+    return Response(content=buf.getvalue(), media_type="image/jpeg")

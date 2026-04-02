@@ -2,6 +2,10 @@
 
 Reads DICOM files (including from ZIP archives), sorts by slice position,
 applies MedGemma CT RGB windowing, and produces PIL Images ready for the model.
+
+Two image versions are produced per slice:
+  - model_image: RGB with MedGemma windowing (for inference)
+  - display_image: Grayscale brain window (for frontend display)
 """
 
 import io
@@ -17,55 +21,45 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# CT Windowing classes (adapted from the repo's generic_dicom_handler.py)
+# CT Windowing — matches the official MedGemma 1.5 notebook exactly
+# See: notebooks/high_dimensional_ct_hugging_face.ipynb, Cell 12
 # ---------------------------------------------------------------------------
 
-class TraditionalWindow:
-    """Single-channel CT window: clips HU values and maps to 0-255."""
+def _norm_window(hu_array: np.ndarray, hu_min: float, hu_max: float) -> np.ndarray:
+    """Window and normalize CT HU values to 0-255 uint8.
 
-    def __init__(self, center: int, width: int):
-        self.center = center
-        self.width = width
-
-    def apply(self, image: np.ndarray) -> np.ndarray:
-        half = self.width // 2
-        lo = self.center - half
-        hi = self.center + half
-        return np.round(
-            np.interp(image.clip(lo, hi), (lo, hi), (0, 255)), 0
-        ).astype(np.uint8)
-
-
-class RGBWindow:
-    """3-channel CT window matching MedGemma 1.5 training.
-
-    Red:   Wide window         (-1024 to 1024 HU)
-    Green: Soft tissue window  (135 to 215 HU)
-    Blue:  Brain window        (0 to 80 HU)
+    Matches the official MedGemma notebook `norm()` function exactly.
     """
-
-    def __init__(
-        self,
-        red: TraditionalWindow,
-        green: TraditionalWindow,
-        blue: TraditionalWindow,
-    ):
-        self._r = red
-        self._g = green
-        self._b = blue
-
-    def apply(self, image: np.ndarray) -> np.ndarray:
-        r = self._r.apply(image)[..., np.newaxis]
-        g = self._g.apply(image)[..., np.newaxis]
-        b = self._b.apply(image)[..., np.newaxis]
-        return np.concatenate([r, g, b], axis=-1)
+    clipped = np.clip(hu_array, hu_min, hu_max).astype(np.float32)
+    clipped -= hu_min
+    clipped /= (hu_max - hu_min)
+    clipped *= 255.0
+    return np.round(clipped, 0).astype(np.uint8)
 
 
-MEDGEMMA_CT_WINDOW = RGBWindow(
-    TraditionalWindow(0, 2048),
-    TraditionalWindow(175, 80),
-    TraditionalWindow(40, 80),
-)
+def apply_medgemma_ct_window(hu_array: np.ndarray) -> np.ndarray:
+    """Apply MedGemma 1.5 RGB CT windowing.
+
+    Official window definitions from the MedGemma CT notebook:
+      Red:   Wide window      (-1024, 1024) HU
+      Green: Soft tissue      (-135,  215)  HU
+      Blue:  Brain window     (0,     80)   HU
+
+    Returns (H, W, 3) uint8 RGB array.
+    """
+    r = _norm_window(hu_array, -1024, 1024)
+    g = _norm_window(hu_array, -135, 215)
+    b = _norm_window(hu_array, 0, 80)
+    return np.stack([r, g, b], axis=-1)
+
+
+def apply_grayscale_brain_window(hu_array: np.ndarray) -> np.ndarray:
+    """Apply a standard brain window for grayscale display.
+
+    Window: center=40, width=80 → range (0, 80) HU
+    Returns (H, W) uint8 grayscale array.
+    """
+    return _norm_window(hu_array, 0, 80)
 
 
 # ---------------------------------------------------------------------------
@@ -159,17 +153,31 @@ def _try_read_dicom(filename: str, raw: bytes) -> pydicom.FileDataset | None:
 
 
 class ProcessedSlice:
-    """A single processed CT slice."""
+    """A single processed CT slice with model and display images."""
 
-    def __init__(self, index: int, position: float, image: PIL.Image.Image, metadata: dict[str, Any]):
+    def __init__(
+        self,
+        index: int,
+        position: float,
+        model_image: PIL.Image.Image,
+        display_image: PIL.Image.Image,
+        metadata: dict[str, Any],
+    ):
         self.index = index
         self.position = position
-        self.image = image
+        self.model_image = model_image      # RGB with MedGemma windowing (for inference)
+        self.display_image = display_image  # Grayscale brain window (for frontend)
         self.metadata = metadata
 
+    @property
+    def image(self) -> PIL.Image.Image:
+        """Alias for model_image — used by inference code."""
+        return self.model_image
+
     def to_jpeg_bytes(self) -> bytes:
+        """Encode the display (grayscale) image as JPEG for the frontend."""
         buf = io.BytesIO()
-        self.image.save(buf, format="JPEG", quality=90)
+        self.display_image.save(buf, format="JPEG", quality=90)
         return buf.getvalue()
 
 
@@ -177,7 +185,7 @@ class CTDicomProcessor:
     """Load a set of DICOM CT files, sort, window, and produce PIL images."""
 
     def __init__(self):
-        self.window = MEDGEMMA_CT_WINDOW
+        pass
 
     def process_files(self, file_contents: list[tuple[str, bytes]]) -> tuple[list[ProcessedSlice], dict[str, Any]]:
         """Process uploaded file contents.
@@ -241,13 +249,21 @@ class CTDicomProcessor:
         self, pixel_array: np.ndarray, dcm: pydicom.FileDataset, index: int
     ) -> ProcessedSlice:
         hu = _rescale_to_hu(pixel_array, dcm)
-        windowed = self.window.apply(hu)  # (H, W, 3) uint8
-        img = PIL.Image.fromarray(windowed, mode="RGB")
+
+        # Model image: RGB with MedGemma 3-channel windowing
+        rgb_windowed = apply_medgemma_ct_window(hu)  # (H, W, 3) uint8
+        model_img = PIL.Image.fromarray(rgb_windowed, mode="RGB")
+
+        # Display image: grayscale brain window for frontend
+        gray_windowed = apply_grayscale_brain_window(hu)  # (H, W) uint8
+        display_img = PIL.Image.fromarray(gray_windowed, mode="L")
+
         position = _slice_sort_key(dcm)
         return ProcessedSlice(
             index=index,
             position=position,
-            image=img,
+            model_image=model_img,
+            display_image=display_img,
             metadata={
                 "instance_number": getattr(dcm, "InstanceNumber", None),
                 "slice_location": getattr(dcm, "SliceLocation", None),

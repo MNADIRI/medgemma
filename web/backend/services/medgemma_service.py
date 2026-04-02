@@ -58,7 +58,8 @@ def _total_ram_gb() -> float:
 @dataclass
 class SessionData:
     """Holds processed slice images for one upload session."""
-    images: list[PIL.Image.Image] = field(default_factory=list)
+    images: list[PIL.Image.Image] = field(default_factory=list)          # model images (RGB windowed)
+    display_images: list[PIL.Image.Image] = field(default_factory=list)  # display images (grayscale)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -68,9 +69,18 @@ class SessionManager:
     def __init__(self) -> None:
         self._sessions: dict[str, SessionData] = {}
 
-    def create(self, images: list[PIL.Image.Image], metadata: dict[str, Any]) -> str:
+    def create(
+        self,
+        images: list[PIL.Image.Image],
+        metadata: dict[str, Any],
+        display_images: list[PIL.Image.Image] | None = None,
+    ) -> str:
         sid = uuid.uuid4().hex
-        self._sessions[sid] = SessionData(images=images, metadata=metadata)
+        self._sessions[sid] = SessionData(
+            images=images,
+            display_images=display_images or images,
+            metadata=metadata,
+        )
         return sid
 
     def get(self, sid: str) -> SessionData | None:
@@ -312,18 +322,7 @@ class MedGemmaService:
         """Run inference using locally loaded model."""
         import torch
 
-        # Local processor expects PIL Image objects, not data URIs
         messages = self._build_messages(session, user_message, selected_slices, history, use_pil=True)
-
-        # Debug: log message structure
-        for msg in messages:
-            for block in msg.get("content", []):
-                if block.get("type") == "image":
-                    img = block.get("image")
-                    logger.info("Image block: type=%s, size=%s, mode=%s",
-                                type(img).__name__,
-                                getattr(img, "size", "N/A"),
-                                getattr(img, "mode", "N/A"))
 
         inputs = self.processor.apply_chat_template(
             messages,
