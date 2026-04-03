@@ -161,12 +161,16 @@ class ProcessedSlice:
         position: float,
         model_image: PIL.Image.Image,
         display_image: PIL.Image.Image,
+        hu_array: np.ndarray,
+        pixel_spacing: tuple[float, float],
         metadata: dict[str, Any],
     ):
         self.index = index
         self.position = position
         self.model_image = model_image      # RGB with MedGemma windowing (for inference)
         self.display_image = display_image  # Grayscale brain window (for frontend)
+        self.hu_array = hu_array            # Raw HU values (float64, H×W)
+        self.pixel_spacing = pixel_spacing  # (row_spacing_mm, col_spacing_mm)
         self.metadata = metadata
 
     @property
@@ -258,12 +262,21 @@ class CTDicomProcessor:
         gray_windowed = apply_grayscale_brain_window(hu)  # (H, W) uint8
         display_img = PIL.Image.fromarray(gray_windowed, mode="L")
 
+        # Extract PixelSpacing (row, col) in mm — default to 1.0 if absent
+        try:
+            ps = dcm.PixelSpacing
+            pixel_spacing = (float(ps[0]), float(ps[1]))
+        except (AttributeError, IndexError):
+            pixel_spacing = (1.0, 1.0)
+
         position = _slice_sort_key(dcm)
         return ProcessedSlice(
             index=index,
             position=position,
             model_image=model_img,
             display_image=display_img,
+            hu_array=hu,
+            pixel_spacing=pixel_spacing,
             metadata={
                 "instance_number": getattr(dcm, "InstanceNumber", None),
                 "slice_location": getattr(dcm, "SliceLocation", None),

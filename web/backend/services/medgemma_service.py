@@ -61,6 +61,8 @@ class SessionData:
     """Holds processed slice images for one upload session."""
     images: list[PIL.Image.Image] = field(default_factory=list)          # model images (RGB windowed)
     display_images: list[PIL.Image.Image] = field(default_factory=list)  # display images (grayscale)
+    hu_arrays: list = field(default_factory=list)                        # raw HU arrays (np.ndarray float64)
+    pixel_spacings: list = field(default_factory=list)                   # (row_mm, col_mm) per slice
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -75,11 +77,15 @@ class SessionManager:
         images: list[PIL.Image.Image],
         metadata: dict[str, Any],
         display_images: list[PIL.Image.Image] | None = None,
+        hu_arrays: list | None = None,
+        pixel_spacings: list | None = None,
     ) -> str:
         sid = uuid.uuid4().hex
         self._sessions[sid] = SessionData(
             images=images,
             display_images=display_images or images,
+            hu_arrays=hu_arrays or [],
+            pixel_spacings=pixel_spacings or [],
             metadata=metadata,
         )
         return sid
@@ -465,61 +471,57 @@ class MedGemmaService:
         history: list[dict[str, str]],
         use_pil: bool = False,
     ) -> list[dict[str, Any]]:
-        """Build the chat message list with interleaved slices and ROI crops.
+        """Build the chat message list with interleaved slices, ROI images, and ROI data.
 
-        Format follows the notebook pattern:
-          instruction, [image, (roi_image)?, "SLICE N"]*, query
+        When MedSAM2 + HU data are available, the prompt includes:
+          - LESION_ANALYSIS_SYSTEM_PROMPT as system instruction
+          - Full slice image + segmented lesion image per ROI
+          - <ROI_DATA> block with quantitative measurements
+          - User question
 
-        For slices with ROIs, both the full slice and the cropped region are
-        sent so SigLip encodes both at full resolution, giving the model a
-        zoomed-in view of the lesion alongside the full anatomical context.
-
-        When use_pil=True (local inference), images are passed as PIL objects.
-        When use_pil=False (remote inference), images are passed as data URIs.
+        Falls back to generic instruction + simple crop when MedSAM2 is unavailable.
         """
+        from services.prompts import (
+            GENERIC_INSTRUCTION,
+            GENERIC_ROI_CROP_ADDENDUM,
+            GENERIC_ROI_SEGMENTED_ADDENDUM,
+            LESION_ANALYSIS_SYSTEM_PROMPT,
+        )
+        from services.roi_analysis import extract_roi_data, format_roi_data
+
         messages: list[dict[str, Any]] = []
 
-        # Replay history using list content format for consistency
+        # Replay history
         for msg in history:
             messages.append({
                 "role": msg["role"],
                 "content": [{"type": "text", "text": msg["content"]}],
             })
 
-        # Current user turn: images + question
+        # Current user turn
         content: list[dict[str, Any]] = []
 
-        # Check if MedSAM2 segmentation is available
         has_segmentation = (
             self.medsam2 is not None
             and self.medsam2.is_loaded
             and bool(rois)
         )
+        has_hu_data = bool(session.hu_arrays) and bool(session.pixel_spacings)
 
-        # Add instruction preamble
-        instruction = (
-            "You are a medical AI assistant analyzing CT scan slices. "
-            "The user has selected specific slices from a CT volume for your review. "
-            "Each slice is labeled with its index number."
-        )
-        if rois:
-            if has_segmentation:
+        # Use structured chain-of-thought prompt when we have full quantitative pipeline
+        use_structured_prompt = has_segmentation and has_hu_data
+
+        # System instruction
+        if use_structured_prompt:
+            content.append({"type": "text", "text": LESION_ANALYSIS_SYSTEM_PROMPT})
+        else:
+            instruction = GENERIC_INSTRUCTION
+            if rois:
                 instruction += (
-                    " Some slices include a segmented region of interest (ROI) where "
-                    "MedSAM2 has isolated the lesion from the surrounding tissue. "
-                    "The segmented image shows only the lesion pixels (on a black "
-                    "background) cropped from the ROI area. Analyze the lesion "
-                    "morphology, density, and borders in detail and provide a "
-                    "differential diagnosis."
+                    GENERIC_ROI_SEGMENTED_ADDENDUM if has_segmentation
+                    else GENERIC_ROI_CROP_ADDENDUM
                 )
-            else:
-                instruction += (
-                    " Some slices include a cropped region of interest (ROI) that the "
-                    "radiologist has highlighted for focused analysis. When an ROI is "
-                    "provided, describe the lesion within it in detail and suggest a "
-                    "differential diagnosis."
-                )
-        content.append({"type": "text", "text": instruction})
+            content.append({"type": "text", "text": instruction})
 
         def _append_image(img: PIL.Image.Image) -> None:
             if use_pil:
@@ -527,56 +529,74 @@ class MedGemmaService:
             else:
                 content.append({"type": "image", "image": _encode_pil_to_data_uri(img)})
 
-        # Add selected slice images with SLICE N markers
+        # Add slice images with ROI processing
         for slice_idx in selected_slices:
-            if 0 <= slice_idx < len(session.images):
-                img = session.images[slice_idx]
-                _append_image(img)
+            if slice_idx < 0 or slice_idx >= len(session.images):
+                continue
 
-                roi = rois.get(slice_idx)
-                if roi:
-                    if has_segmentation:
-                        # Use MedSAM2 to segment the lesion, then send isolated image
-                        display_img = session.display_images[slice_idx]
-                        try:
-                            _, isolated_img = self.medsam2.segment_and_isolate(
-                                img, display_img, roi
-                            )
-                            logger.info(
-                                "Slice %d: MedSAM2 segmented ROI → isolated image %dx%d",
-                                slice_idx, isolated_img.width, isolated_img.height,
-                            )
-                            _append_image(isolated_img)
+            img = session.images[slice_idx]
+            _append_image(img)
+
+            roi = rois.get(slice_idx)
+            if roi:
+                if has_segmentation:
+                    display_img = session.display_images[slice_idx]
+                    try:
+                        mask, isolated_img = self.medsam2.segment_and_isolate(
+                            img, display_img, roi
+                        )
+                        logger.info(
+                            "Slice %d: MedSAM2 segmented ROI → isolated %dx%d",
+                            slice_idx, isolated_img.width, isolated_img.height,
+                        )
+                        _append_image(isolated_img)
+
+                        # Extract and inject quantitative ROI data
+                        if use_structured_prompt and slice_idx < len(session.hu_arrays):
+                            hu = session.hu_arrays[slice_idx]
+                            ps = session.pixel_spacings[slice_idx]
+                            try:
+                                roi_data = extract_roi_data(hu, mask, ps)
+                                roi_block = format_roi_data(roi_data)
+                                content.append({"type": "text", "text": (
+                                    f"SLICE {slice_idx + 1} — full view + segmented lesion above.\n\n"
+                                    f"{roi_block}"
+                                )})
+                                logger.info(
+                                    "Slice %d: ROI data extracted (mean=%.1f HU, area=%.1f mm²)",
+                                    slice_idx,
+                                    roi_data["density"]["mean"],
+                                    roi_data["morphometry"]["area_mm2"],
+                                )
+                            except Exception as exc:
+                                logger.warning("ROI data extraction failed for slice %d: %s", slice_idx, exc)
+                                content.append({"type": "text", "text": (
+                                    f"SLICE {slice_idx + 1} — full view + segmented lesion above "
+                                    f"(quantitative data unavailable)"
+                                )})
+                        else:
                             content.append({"type": "text", "text": (
-                                f"SLICE {slice_idx + 1} — full view above, "
-                                f"segmented lesion ROI above (MedSAM2 isolated)"
+                                f"SLICE {slice_idx + 1} — full view + segmented lesion above"
                             )})
-                        except Exception as exc:
-                            logger.warning("MedSAM2 failed for slice %d: %s, falling back to crop", slice_idx, exc)
-                            # Fall back to simple crop
-                            cropped = self._crop_roi(img, roi)
-                            _append_image(cropped)
-                            content.append({"type": "text", "text": (
-                                f"SLICE {slice_idx + 1} — full view above, "
-                                f"ROI crop above (segmentation unavailable)"
-                            )})
-                    else:
-                        # Simple crop fallback when MedSAM2 not available
+
+                    except Exception as exc:
+                        logger.warning("MedSAM2 failed for slice %d: %s, falling back to crop", slice_idx, exc)
                         cropped = self._crop_roi(img, roi)
                         _append_image(cropped)
-                        w, h = img.size
-                        left = int(roi["x"] * w)
-                        top = int(roi["y"] * h)
-                        right = int((roi["x"] + roi["width"]) * w)
-                        bottom = int((roi["y"] + roi["height"]) * h)
                         content.append({"type": "text", "text": (
-                            f"SLICE {slice_idx + 1} — full view above, "
-                            f"ROI detail above (region {left},{top} to {right},{bottom})"
+                            f"SLICE {slice_idx + 1} — full view + ROI crop above "
+                            f"(segmentation unavailable)"
                         )})
                 else:
-                    content.append({"type": "text", "text": f"SLICE {slice_idx + 1}"})
+                    cropped = self._crop_roi(img, roi)
+                    _append_image(cropped)
+                    content.append({"type": "text", "text": (
+                        f"SLICE {slice_idx + 1} — full view + ROI crop above"
+                    )})
+            else:
+                content.append({"type": "text", "text": f"SLICE {slice_idx + 1}"})
 
-        # Add user question
+        # User question
         content.append({"type": "text", "text": f"\n\n{user_message}"})
 
         messages.append({"role": "user", "content": content})
