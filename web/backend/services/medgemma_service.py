@@ -542,6 +542,10 @@ class MedGemmaService:
                             _, isolated_img = self.medsam2.segment_and_isolate(
                                 img, display_img, roi
                             )
+                            logger.info(
+                                "Slice %d: MedSAM2 segmented ROI → isolated image %dx%d",
+                                slice_idx, isolated_img.width, isolated_img.height,
+                            )
                             _append_image(isolated_img)
                             content.append({"type": "text", "text": (
                                 f"SLICE {slice_idx + 1} — full view above, "
