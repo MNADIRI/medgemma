@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { uploadDicom } from "./api/client";
+import { segmentRoi, uploadDicom } from "./api/client";
 import ChatPanel from "./components/ChatPanel";
 import DicomDropZone from "./components/DicomDropZone";
 import SliceViewer from "./components/SliceViewer";
@@ -18,6 +18,7 @@ export default function App() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(new Set());
   const [roiMap, setRoiMap] = useState<Map<number, ROI>>(new Map());
+  const [maskMap, setMaskMap] = useState<Map<number, string>>(new Map()); // slice index → mask blob URL
 
   // Chat
   const { messages, isLoading, send, reset } = useChat(sessionId, selectedIndices, roiMap);
@@ -57,6 +58,11 @@ export default function App() {
       setCurrentIndex(0);
       setSelectedIndices(new Set());
       setRoiMap(new Map());
+      // Revoke all mask blob URLs
+      setMaskMap((prev) => {
+        for (const url of prev.values()) URL.revokeObjectURL(url);
+        return new Map();
+      });
       reset();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Upload failed";
@@ -97,7 +103,29 @@ export default function App() {
       else next.delete(index);
       return next;
     });
-  }, []);
+
+    // Revoke old mask blob URL if any
+    setMaskMap((prev) => {
+      const old = prev.get(index);
+      if (old) URL.revokeObjectURL(old);
+      const next = new Map(prev);
+      next.delete(index);
+      return next;
+    });
+
+    // Request segmentation if ROI was set
+    if (roi && sessionId) {
+      segmentRoi(sessionId, index, roi).then((maskUrl) => {
+        if (maskUrl) {
+          setMaskMap((prev) => {
+            const next = new Map(prev);
+            next.set(index, maskUrl);
+            return next;
+          });
+        }
+      });
+    }
+  }, [sessionId]);
 
   return (
     <div
@@ -161,6 +189,7 @@ export default function App() {
                 currentIndex={currentIndex}
                 selectedIndices={selectedIndices}
                 roiMap={roiMap}
+                maskMap={maskMap}
                 onCurrentChange={setCurrentIndex}
                 onToggleSelect={handleToggleSelect}
                 onSelectAll={handleSelectAll}

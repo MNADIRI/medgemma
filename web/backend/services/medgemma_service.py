@@ -131,6 +131,7 @@ class MedGemmaService:
         self.backend = INFERENCE_BACKEND  # "local" or "remote"
         self.hf_client = None
         self.sessions = SessionManager()
+        self.medsam2 = None  # Set externally after MedSAM2 loads
 
     def load_model(self) -> None:
         """Load model locally or connect to HF Inference API."""
@@ -488,6 +489,13 @@ class MedGemmaService:
         # Current user turn: images + question
         content: list[dict[str, Any]] = []
 
+        # Check if MedSAM2 segmentation is available
+        has_segmentation = (
+            self.medsam2 is not None
+            and self.medsam2.is_loaded
+            and bool(rois)
+        )
+
         # Add instruction preamble
         instruction = (
             "You are a medical AI assistant analyzing CT scan slices. "
@@ -495,12 +503,22 @@ class MedGemmaService:
             "Each slice is labeled with its index number."
         )
         if rois:
-            instruction += (
-                " Some slices include a cropped region of interest (ROI) that the "
-                "radiologist has highlighted for focused analysis. When an ROI is "
-                "provided, describe the lesion within it in detail and suggest a "
-                "differential diagnosis."
-            )
+            if has_segmentation:
+                instruction += (
+                    " Some slices include a segmented region of interest (ROI) where "
+                    "MedSAM2 has isolated the lesion from the surrounding tissue. "
+                    "The segmented image shows only the lesion pixels (on a black "
+                    "background) cropped from the ROI area. Analyze the lesion "
+                    "morphology, density, and borders in detail and provide a "
+                    "differential diagnosis."
+                )
+            else:
+                instruction += (
+                    " Some slices include a cropped region of interest (ROI) that the "
+                    "radiologist has highlighted for focused analysis. When an ROI is "
+                    "provided, describe the lesion within it in detail and suggest a "
+                    "differential diagnosis."
+                )
         content.append({"type": "text", "text": instruction})
 
         def _append_image(img: PIL.Image.Image) -> None:
@@ -517,21 +535,40 @@ class MedGemmaService:
 
                 roi = rois.get(slice_idx)
                 if roi:
-                    # Crop ROI from the model image (RGB windowed)
-                    w, h = img.size
-                    left = int(roi["x"] * w)
-                    top = int(roi["y"] * h)
-                    right = int((roi["x"] + roi["width"]) * w)
-                    bottom = int((roi["y"] + roi["height"]) * h)
-                    # Clamp to image bounds
-                    left, top = max(0, left), max(0, top)
-                    right, bottom = min(w, right), min(h, bottom)
-                    cropped = img.crop((left, top, right, bottom))
-                    _append_image(cropped)
-                    content.append({"type": "text", "text": (
-                        f"SLICE {slice_idx + 1} — full view above, "
-                        f"ROI detail above (region {left},{top} to {right},{bottom})"
-                    )})
+                    if has_segmentation:
+                        # Use MedSAM2 to segment the lesion, then send isolated image
+                        display_img = session.display_images[slice_idx]
+                        try:
+                            _, isolated_img = self.medsam2.segment_and_isolate(
+                                img, display_img, roi
+                            )
+                            _append_image(isolated_img)
+                            content.append({"type": "text", "text": (
+                                f"SLICE {slice_idx + 1} — full view above, "
+                                f"segmented lesion ROI above (MedSAM2 isolated)"
+                            )})
+                        except Exception as exc:
+                            logger.warning("MedSAM2 failed for slice %d: %s, falling back to crop", slice_idx, exc)
+                            # Fall back to simple crop
+                            cropped = self._crop_roi(img, roi)
+                            _append_image(cropped)
+                            content.append({"type": "text", "text": (
+                                f"SLICE {slice_idx + 1} — full view above, "
+                                f"ROI crop above (segmentation unavailable)"
+                            )})
+                    else:
+                        # Simple crop fallback when MedSAM2 not available
+                        cropped = self._crop_roi(img, roi)
+                        _append_image(cropped)
+                        w, h = img.size
+                        left = int(roi["x"] * w)
+                        top = int(roi["y"] * h)
+                        right = int((roi["x"] + roi["width"]) * w)
+                        bottom = int((roi["y"] + roi["height"]) * h)
+                        content.append({"type": "text", "text": (
+                            f"SLICE {slice_idx + 1} — full view above, "
+                            f"ROI detail above (region {left},{top} to {right},{bottom})"
+                        )})
                 else:
                     content.append({"type": "text", "text": f"SLICE {slice_idx + 1}"})
 
@@ -540,3 +577,13 @@ class MedGemmaService:
 
         messages.append({"role": "user", "content": content})
         return messages
+
+    @staticmethod
+    def _crop_roi(img: PIL.Image.Image, roi: dict) -> PIL.Image.Image:
+        """Crop an ROI region from a PIL image using normalized coordinates."""
+        w, h = img.size
+        left = max(0, int(roi["x"] * w))
+        top = max(0, int(roi["y"] * h))
+        right = min(w, int((roi["x"] + roi["width"]) * w))
+        bottom = min(h, int((roi["y"] + roi["height"]) * h))
+        return img.crop((left, top, right, bottom))

@@ -9,6 +9,7 @@ interface Props {
   currentIndex: number;
   selectedIndices: Set<number>;
   roiMap: Map<number, ROI>;
+  maskMap: Map<number, string>;
   onCurrentChange: (index: number) => void;
   onToggleSelect: (index: number) => void;
   onSelectAll: () => void;
@@ -22,6 +23,7 @@ export default function SliceViewer({
   currentIndex,
   selectedIndices,
   roiMap,
+  maskMap,
   onCurrentChange,
   onToggleSelect,
   onSelectAll,
@@ -55,6 +57,21 @@ export default function SliceViewer({
           alt={`Slice ${currentIndex + 1}`}
           style={{ width: "100%", display: "block", imageRendering: "auto" }}
         />
+        {/* MedSAM2 segmentation mask overlay */}
+        {maskMap.has(currentIndex) && (
+          <img
+            src={maskMap.get(currentIndex)}
+            alt="Segmentation mask"
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              width: "100%",
+              height: "100%",
+              pointerEvents: "none",
+            }}
+          />
+        )}
         <RoiCanvas
           currentRoi={roiMap.get(currentIndex) ?? null}
           onRoiChange={(roi) => onSetRoi(currentIndex, roi)}

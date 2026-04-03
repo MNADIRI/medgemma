@@ -73,3 +73,30 @@ export async function sendChat(
 export function sliceUrl(sessionId: string, index: number): string {
   return `${BASE}/slices/${sessionId}/${index}`;
 }
+
+/**
+ * Request MedSAM2 segmentation for a ROI on a slice.
+ * Returns a blob URL for the semi-transparent PNG mask overlay, or null if unavailable.
+ */
+export async function segmentRoi(
+  sessionId: string,
+  sliceIndex: number,
+  roi: ROI
+): Promise<string | null> {
+  try {
+    const res = await fetch(`${BASE}/segment`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        slice_index: sliceIndex,
+        roi,
+      }),
+    });
+    if (!res.ok) return null; // 503 = MedSAM2 not loaded, graceful fallback
+    const blob = await res.blob();
+    return URL.createObjectURL(blob);
+  } catch {
+    return null; // Network error, graceful fallback
+  }
+}

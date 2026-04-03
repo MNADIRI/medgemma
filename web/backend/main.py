@@ -9,19 +9,27 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from routers import chat, dicom
 from services.medgemma_service import MedGemmaService
+from services.medsam2_service import MedSAM2Service
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 medgemma = MedGemmaService()
+medsam2 = MedSAM2Service()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load MedGemma model on startup."""
+    """Load models on startup."""
     medgemma.load_model()
     app.state.medgemma = medgemma
-    logger.info("MedGemma service ready")
+
+    medsam2.load_model()
+    app.state.medsam2 = medsam2
+    medgemma.medsam2 = medsam2  # Allow chat pipeline to use segmentation
+
+    logger.info("Services ready (MedGemma=%s, MedSAM2=%s)",
+                medgemma.backend, "loaded" if medsam2.is_loaded else "disabled")
     yield
     logger.info("Shutting down")
 
@@ -47,7 +55,12 @@ app.include_router(chat.router)
 @app.get("/api/health")
 async def health():
     ready = medgemma.model is not None or medgemma.hf_client is not None
-    return {"status": "ok", "backend": medgemma.backend, "model_loaded": ready}
+    return {
+        "status": "ok",
+        "backend": medgemma.backend,
+        "model_loaded": ready,
+        "medsam2_loaded": medsam2.is_loaded,
+    }
 
 
 if __name__ == "__main__":
