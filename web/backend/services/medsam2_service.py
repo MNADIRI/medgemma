@@ -9,8 +9,6 @@ on black background) for MedGemma to analyze alongside the full slice.
 
 import logging
 import os
-from pathlib import Path
-from typing import Any
 
 import numpy as np
 import PIL.Image
@@ -18,6 +16,8 @@ import PIL.Image
 logger = logging.getLogger(__name__)
 
 MEDSAM2_CHECKPOINT = os.environ.get("MEDSAM2_CHECKPOINT", "MedSAM2_CTLesion.pt")
+# Config is resolved by Hydra relative to the sam2 package (pkg://sam2).
+# Must be a relative path like "configs/sam2.1_hiera_t512.yaml", NOT absolute.
 MEDSAM2_CONFIG = os.environ.get("MEDSAM2_CONFIG", "configs/sam2.1_hiera_t512.yaml")
 MEDSAM2_IMAGE_SIZE = 512
 
@@ -59,14 +59,11 @@ class MedSAM2Service:
             logger.warning("MedSAM2 checkpoint not found — segmentation disabled")
             return
 
-        # Resolve config path
-        config = self._resolve_config()
-        if config is None:
-            logger.warning("MedSAM2 config not found — segmentation disabled")
-            return
+        # Config is resolved by Hydra relative to pkg://sam2 — just use the relative name
+        config = MEDSAM2_CONFIG
 
         try:
-            logger.info("Loading MedSAM2 from %s …", checkpoint)
+            logger.info("Loading MedSAM2 from %s (config=%s)…", checkpoint, config)
             self.predictor = build_sam2_video_predictor_npz(config, checkpoint)
             self._device = "cuda"
             logger.info("MedSAM2 loaded on CUDA")
@@ -97,36 +94,6 @@ class MedSAM2Service:
         except Exception as exc:
             logger.warning("Could not download MedSAM2 checkpoint: %s", exc)
             return None
-
-    def _resolve_config(self) -> str | None:
-        """Find the MedSAM2 config YAML file."""
-        candidates = [
-            MEDSAM2_CONFIG,
-            f"/content/MedSAM2/{MEDSAM2_CONFIG}",
-        ]
-        # Check relative to the sam2 package location (editable install)
-        try:
-            import sam2
-            pkg_dir = Path(sam2.__file__).parent
-            # sam2/__init__.py → sam2/ → parent has configs/
-            candidates.append(str(pkg_dir.parent / MEDSAM2_CONFIG))
-            # Also check inside the sam2 package directory itself
-            candidates.append(str(pkg_dir / MEDSAM2_CONFIG))
-            # The config name without the configs/ prefix, in case it's flattened
-            config_basename = Path(MEDSAM2_CONFIG).name
-            candidates.append(str(pkg_dir / "configs" / config_basename))
-            candidates.append(str(pkg_dir.parent / "configs" / config_basename))
-        except (ImportError, AttributeError):
-            pass
-
-        for path in candidates:
-            logger.debug("Checking config path: %s (exists=%s)", path, os.path.isfile(path))
-            if os.path.isfile(path):
-                return path
-
-        # Log all tried paths for debugging
-        logger.warning("MedSAM2 config not found in any of: %s", candidates)
-        return None
 
     def segment_slice(
         self,
