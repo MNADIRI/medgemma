@@ -120,44 +120,111 @@ def _clean_thinking_tokens(text: str) -> str:
 
 
 def _parse_analysis_response(text: str) -> dict[str, Any]:
-    """Parse the structured XML/JSON blocks from MedGemma's analysis response.
+    """Parse the structured XML text blocks from MedGemma's analysis response.
 
-    Extracts <CHAIN_OF_THOUGHT>, <REPORT>, and <DIAGNOSIS> blocks,
-    each containing JSON. Returns dict with parsed JSON or None for each block.
+    Extracts <LOCALISATION>, <ASPECT>, and <DIAGNOSIS> blocks as plain text.
+    MedGemma 4B cannot reliably produce JSON, so we use simple text extraction
+    and parse the diagnosis entries with regex.
     """
-    import json
     import re
 
     result: dict[str, Any] = {
-        "chain_of_thought": None,
-        "report": None,
+        "localisation": None,
+        "aspect": None,
         "diagnosis": None,
     }
 
-    tag_map = {
-        "CHAIN_OF_THOUGHT": "chain_of_thought",
-        "REPORT": "report",
-        "DIAGNOSIS": "diagnosis",
-    }
-
-    for xml_tag, key in tag_map.items():
-        pattern = rf"<{xml_tag}>\s*(.*?)\s*</{xml_tag}>"
+    # Extract text content from XML tags
+    for tag in ("LOCALISATION", "ASPECT", "DIAGNOSIS"):
+        pattern = rf"<{tag}>\s*(.*?)\s*</{tag}>"
         match = re.search(pattern, text, re.DOTALL)
         if match:
-            json_str = match.group(1).strip()
-            try:
-                result[key] = json.loads(json_str)
-            except json.JSONDecodeError as exc:
-                logger.warning("Failed to parse <%s> JSON: %s", xml_tag, exc)
-                # Try to fix common issues (trailing commas)
-                cleaned = re.sub(r",\s*([}\]])", r"\1", json_str)
-                try:
-                    result[key] = json.loads(cleaned)
-                except json.JSONDecodeError:
-                    logger.warning("<%s> JSON recovery failed, storing as raw text", xml_tag)
-                    result[key] = {"_raw": json_str}
+            result[tag.lower()] = match.group(1).strip()
+
+    # If tags weren't found, try to extract from raw text by section headers
+    if not result["localisation"]:
+        m = re.search(r"(?:LOCALI[SZ]ATION|Step\s*1)[:\s—-]*(.*?)(?=(?:ASPECT|Step\s*2|DIAGNOS|<)|$)", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            result["localisation"] = m.group(1).strip()
+
+    if not result["aspect"]:
+        m = re.search(r"(?:ASPECT|CHARACTERI[SZ]|Step\s*2)[:\s—-]*(.*?)(?=(?:DIAGNOS|Step\s*3|<)|$)", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            result["aspect"] = m.group(1).strip()
+
+    if not result["diagnosis"]:
+        m = re.search(r"(?:DIAGNOS\w*|Step\s*3)[:\s—-]*(.*?)$", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            result["diagnosis"] = m.group(1).strip()
+
+    # Parse individual diagnosis entries from the diagnosis text
+    result["diagnosis_entries"] = _parse_diagnosis_entries(result.get("diagnosis") or "")
 
     return result
+
+
+def _parse_diagnosis_entries(text: str) -> list[dict[str, str]]:
+    """Extract ranked diagnosis entries from diagnosis text.
+
+    Handles formats like:
+      1. LIKELY: Name. Supporting: ... Against: ...
+      1. **Likely** — Name: ...
+      - Likely: Name ...
+    """
+    import re
+
+    entries = []
+    # Split on numbered items (1., 2., 3.) or bullet points
+    parts = re.split(r"\n\s*(?:\d+[\.\)]\s*|[-•]\s*)", text)
+    # Also try to match lines starting with tier keywords
+    if len(parts) <= 1:
+        parts = re.split(r"\n\s*(?=(?:LIKELY|POSSIBLE|UNLIKELY|Most likely|Possible|Unlikely))", text, flags=re.IGNORECASE)
+
+    tier_map = {
+        "likely": "likely",
+        "most likely": "likely",
+        "possible": "possible",
+        "unlikely": "unlikely_but_to_exclude",
+        "unlikely but to exclude": "unlikely_but_to_exclude",
+    }
+
+    for part in parts:
+        part = part.strip()
+        if not part or len(part) < 10:
+            continue
+
+        # Try to extract tier
+        tier = "possible"  # default
+        for keyword, tier_val in tier_map.items():
+            if keyword.lower() in part.lower()[:50]:
+                tier = tier_val
+                break
+
+        # Try to extract label (diagnosis name)
+        # Pattern: TIER: Label. Supporting: ...
+        label_match = re.search(
+            r"(?:LIKELY|POSSIBLE|UNLIKELY[^:]*)[:\s—-]+\*?\*?([^.:\n]+)",
+            part, re.IGNORECASE
+        )
+        label = label_match.group(1).strip().strip("*").strip() if label_match else part[:80]
+
+        # Extract supporting features
+        support_match = re.search(r"[Ss]upporting[:\s]+(.*?)(?=[Aa]gainst|$)", part, re.DOTALL)
+        supporting = support_match.group(1).strip() if support_match else ""
+
+        # Extract against features
+        against_match = re.search(r"[Aa]gainst[:\s]+(.*?)$", part, re.DOTALL)
+        against = against_match.group(1).strip() if against_match else ""
+
+        entries.append({
+            "tier": tier,
+            "label": label,
+            "supporting": supporting,
+            "against": against,
+            "raw": part,
+        })
+
+    return entries[:3]  # At most 3
 
 
 def _encode_pil_to_data_uri(img: PIL.Image.Image, fmt: str = "jpeg") -> str:
@@ -407,9 +474,8 @@ class MedGemmaService:
     ) -> dict[str, Any]:
         """Run structured lesion analysis on a single slice with ROI.
 
-        Uses the full analysis system prompt and returns parsed XML blocks.
-        Returns dict with 'chain_of_thought', 'report', 'diagnosis',
-        'raw_response', and 'usage' keys.
+        Uses the analysis system prompt. Returns parsed text blocks
+        plus the quantitative ROI data from our pipeline.
         """
         session = self.sessions.get(session_id)
         if session is None:
@@ -418,7 +484,7 @@ class MedGemmaService:
         if slice_index < 0 or slice_index >= len(session.images):
             raise ValueError(f"Slice index {slice_index} out of range")
 
-        messages = self._build_analyze_messages(session, slice_index, roi)
+        messages, roi_data = self._build_analyze_messages(session, slice_index, roi)
 
         logger.info("Analyze (%s): slice %d with ROI", self.backend, slice_index)
 
@@ -431,14 +497,16 @@ class MedGemmaService:
             logger.error("Analyze inference failed:\n%s", traceback.format_exc())
             raise
 
-        # Parse XML blocks from model response
+        # Parse text blocks from model response
         raw = result["response"]
         parsed = _parse_analysis_response(raw)
 
         return {
-            "chain_of_thought": parsed.get("chain_of_thought"),
-            "report": parsed.get("report"),
-            "diagnosis": parsed.get("diagnosis"),
+            "localisation": parsed.get("localisation"),
+            "aspect": parsed.get("aspect"),
+            "diagnosis_text": parsed.get("diagnosis"),
+            "diagnosis_entries": parsed.get("diagnosis_entries", []),
+            "roi_data": roi_data,
             "raw_response": raw,
             "usage": result["usage"],
         }
@@ -449,8 +517,12 @@ class MedGemmaService:
         slice_index: int,
         roi: dict,
         use_pil: bool | None = None,
-    ) -> list[dict[str, Any]]:
-        """Build messages for structured analysis (system prompt + slice + ROI + ROI data)."""
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        """Build messages for structured analysis.
+
+        Returns (messages, roi_data) — roi_data is the quantitative dict
+        from our pipeline (sent to frontend independently of model output).
+        """
         from services.prompts import LESION_ANALYSIS_SYSTEM_PROMPT
         from services.roi_analysis import extract_roi_data, format_roi_data
 
@@ -458,6 +530,7 @@ class MedGemmaService:
             use_pil = self.backend != "remote"
 
         content: list[dict[str, Any]] = []
+        roi_data: dict[str, Any] | None = None
 
         # System instruction
         content.append({"type": "text", "text": LESION_ANALYSIS_SYSTEM_PROMPT})
@@ -525,7 +598,7 @@ class MedGemmaService:
 
         content.append({"type": "text", "text": prompt})
 
-        return [{"role": "user", "content": content}]
+        return [{"role": "user", "content": content}], roi_data
 
     def _infer_local_analyze(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         """Run local inference for structured analysis (higher token limit)."""

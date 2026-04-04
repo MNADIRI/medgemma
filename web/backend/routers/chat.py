@@ -64,9 +64,11 @@ async def analyze(request: Request, body: AnalyzeRequest):
 
     usage = UsageInfo(**(result.get("usage") or {}))
     return AnalyzeResponse(
-        chain_of_thought=result.get("chain_of_thought"),
-        report=result.get("report"),
-        diagnosis=result.get("diagnosis"),
+        localisation=result.get("localisation"),
+        aspect=result.get("aspect"),
+        diagnosis_text=result.get("diagnosis_text"),
+        diagnosis_entries=result.get("diagnosis_entries", []),
+        roi_data=result.get("roi_data"),
         raw_response=result["raw_response"],
         usage=usage,
     )

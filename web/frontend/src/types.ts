@@ -44,49 +44,53 @@ export interface ChatResponse {
 
 // ── Structured analysis types ──────────────────────────────────────────
 
-export interface AnalysisReport {
-  localisation: {
-    text: string;
-    organ: string;
-    segment: string | null;
-    laterality: string;
-    position: string;
-  };
-  aspect: {
-    text: string;
-    density_class: string;
-    delta_hu: number;
-    homogeneity: string;
-    margins: string;
-    shape: string;
-    aspect_ratio: number;
-    mass_effect: boolean;
-  };
-  taille: {
-    text: string;
-    long_axis_mm: number;
-    short_axis_mm: number;
-    area_mm2: number;
-  };
-}
-
 export interface DiagnosisEntry {
-  rank: number;
-  tier: "likely" | "possible" | "unlikely_but_to_exclude";
+  tier: string;
   label: string;
-  supporting_features: string[];
-  against_features: string[];
-  confidence_rationale: string;
+  supporting: string;
+  against: string;
+  raw: string;
 }
 
-export interface AnalysisDiagnosis {
-  diagnostics: DiagnosisEntry[];
+/** ROI quantitative data from the pipeline (always reliable) */
+export interface RoiData {
+  density: {
+    mean: number;
+    median: number;
+    sd: number;
+    min: number;
+    max: number;
+    deciles: number[];
+    density_asymmetry: number;
+  };
+  peri_lesional: {
+    mean: number | null;
+    sd: number | null;
+    delta_hu_median_parenchyma: number | null;
+  };
+  morphometry: {
+    major_axis_mm: number;
+    minor_axis_mm: number;
+    aspect_ratio: number;
+    area_mm2: number;
+    perimeter_mm: number;
+    compactness: number;
+    solidity: number;
+    eroded_area_fraction: number;
+  };
+  spatial: {
+    laterality: string;
+    antero_posterior: string;
+    patient_xyz_mm: number[] | null;
+  };
 }
 
 export interface AnalysisResult {
-  chain_of_thought: Record<string, unknown> | null;
-  report: AnalysisReport | null;
-  diagnosis: AnalysisDiagnosis | null;
+  localisation: string | null;      // model's localization text
+  aspect: string | null;            // model's characterization text
+  diagnosis_text: string | null;    // model's diagnosis text
+  diagnosis_entries: DiagnosisEntry[];
+  roi_data: RoiData | null;         // quantitative data from pipeline
   raw_response: string;
   usage: { input_tokens: number | null; output_tokens: number | null } | null;
 }

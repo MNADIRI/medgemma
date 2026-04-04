@@ -1,5 +1,5 @@
-import { useCallback, useState } from "react";
-import type { AnalysisResult } from "../types";
+import { useState } from "react";
+import type { AnalysisResult, DiagnosisEntry, RoiData } from "../types";
 
 interface Props {
   analysis: AnalysisResult;
@@ -67,7 +67,8 @@ function CollapsibleSection({
 }
 
 export default function AnalysisPanel({ analysis }: Props) {
-  const { report, diagnosis, chain_of_thought } = analysis;
+  const { localisation, aspect, diagnosis_entries, roi_data, raw_response } = analysis;
+  const hasModelText = localisation || aspect || (diagnosis_entries && diagnosis_entries.length > 0);
 
   return (
     <div
@@ -100,106 +101,64 @@ export default function AnalysisPanel({ analysis }: Props) {
 
       {/* Scrollable content */}
       <div style={{ flex: 1, overflowY: "auto", padding: 12 }}>
-        {/* Report section */}
-        {report && !("_raw" in report) ? (
-          <CollapsibleSection title="REPORT" defaultOpen={true}>
-            <ReportContent report={report} />
-          </CollapsibleSection>
-        ) : (
-          <CollapsibleSection title="REPORT" defaultOpen={true}>
-            <p style={{ color: "#888", fontSize: 13, margin: 0 }}>
-              Report parsing failed. See raw output below.
-            </p>
-          </CollapsibleSection>
-        )}
-
-        {/* Diagnosis section */}
-        {diagnosis && !("_raw" in diagnosis) ? (
-          <CollapsibleSection title="DIAGNOSIS" defaultOpen={true} badge={`${diagnosis.diagnostics?.length ?? 0} dx`}>
-            <DiagnosisContent diagnosis={diagnosis} />
-          </CollapsibleSection>
-        ) : (
-          <CollapsibleSection title="DIAGNOSIS" defaultOpen={true}>
-            <p style={{ color: "#888", fontSize: 13, margin: 0 }}>
-              Diagnosis parsing failed. See raw output below.
-            </p>
-          </CollapsibleSection>
-        )}
-
-        {/* Chain of thought (reasoning) — collapsed by default */}
-        <CollapsibleSection title="REASONING" defaultOpen={false}>
-          {chain_of_thought && !("_raw" in chain_of_thought) ? (
-            <ReasoningContent cot={chain_of_thought} />
+        {/* Report section — model text */}
+        <CollapsibleSection title="REPORT" defaultOpen={true}>
+          {hasModelText ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, fontSize: 13, color: "#ccc" }}>
+              {localisation && (
+                <div>
+                  <div style={{ fontSize: 11, color: "#4a90d9", fontWeight: 600, marginBottom: 4 }}>LOCALISATION</div>
+                  <p style={{ margin: 0, lineHeight: 1.5 }}>{localisation}</p>
+                </div>
+              )}
+              {aspect && (
+                <div>
+                  <div style={{ fontSize: 11, color: "#4a90d9", fontWeight: 600, marginBottom: 4 }}>ASPECT</div>
+                  <p style={{ margin: 0, lineHeight: 1.5, whiteSpace: "pre-wrap" }}>{aspect}</p>
+                </div>
+              )}
+            </div>
           ) : (
-            <pre
-              style={{
-                color: "#999",
-                fontSize: 12,
-                fontFamily: "monospace",
-                whiteSpace: "pre-wrap",
-                margin: 0,
-                maxHeight: 300,
-                overflow: "auto",
-              }}
-            >
-              {analysis.raw_response}
+            <pre style={{ color: "#999", fontSize: 12, whiteSpace: "pre-wrap", margin: 0 }}>
+              {raw_response || "No response from model."}
             </pre>
           )}
         </CollapsibleSection>
+
+        {/* Diagnosis section */}
+        <CollapsibleSection
+          title="DIAGNOSIS"
+          defaultOpen={true}
+          badge={diagnosis_entries?.length ? `${diagnosis_entries.length} dx` : undefined}
+        >
+          {diagnosis_entries && diagnosis_entries.length > 0 ? (
+            <DiagnosisCards entries={diagnosis_entries} />
+          ) : analysis.diagnosis_text ? (
+            <pre style={{ color: "#ccc", fontSize: 12, whiteSpace: "pre-wrap", margin: 0, lineHeight: 1.5 }}>
+              {analysis.diagnosis_text}
+            </pre>
+          ) : (
+            <p style={{ color: "#888", fontSize: 13, margin: 0 }}>No diagnosis parsed.</p>
+          )}
+        </CollapsibleSection>
+
+        {/* ROI Data section — always reliable from pipeline */}
+        {roi_data && (
+          <CollapsibleSection title="ROI DATA" defaultOpen={false} badge="pipeline">
+            <RoiDataPanel data={roi_data} />
+          </CollapsibleSection>
+        )}
       </div>
     </div>
   );
 }
 
-/* ── Sub-components ──────────────────────────────────────────────────── */
+/* ── Diagnosis cards ─────────────────────────────────────────────────── */
 
-function ReportContent({ report }: { report: NonNullable<AnalysisResult["report"]> }) {
-  const { localisation, aspect, taille } = report;
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 10, fontSize: 13, color: "#ccc" }}>
-      {/* Localisation */}
-      <div>
-        <div style={{ fontSize: 11, color: "#4a90d9", fontWeight: 600, marginBottom: 4 }}>LOCALISATION</div>
-        <p style={{ margin: 0, lineHeight: 1.5 }}>{localisation?.text || "N/A"}</p>
-        {localisation?.laterality && (
-          <div style={{ display: "flex", gap: 6, marginTop: 4, flexWrap: "wrap" }}>
-            <Tag label={localisation.laterality} />
-            {localisation.position && <Tag label={localisation.position} />}
-            {localisation.organ && <Tag label={localisation.organ} color="#2a4a2a" />}
-          </div>
-        )}
-      </div>
-
-      {/* Aspect */}
-      <div>
-        <div style={{ fontSize: 11, color: "#4a90d9", fontWeight: 600, marginBottom: 4 }}>ASPECT</div>
-        <p style={{ margin: 0, lineHeight: 1.5 }}>{aspect?.text || "N/A"}</p>
-        {aspect && (
-          <div style={{ display: "flex", gap: 6, marginTop: 4, flexWrap: "wrap" }}>
-            <Tag label={`${aspect.density_class} (Δ${aspect.delta_hu >= 0 ? "+" : ""}${aspect.delta_hu?.toFixed?.(1) ?? "?"} HU)`} />
-            <Tag label={aspect.homogeneity} />
-            <Tag label={aspect.margins?.replace("_", " ")} />
-            <Tag label={`${aspect.shape?.replace("_", " ")} (AR ${aspect.aspect_ratio?.toFixed?.(2) ?? "?"})`} />
-          </div>
-        )}
-      </div>
-
-      {/* Taille */}
-      <div>
-        <div style={{ fontSize: 11, color: "#4a90d9", fontWeight: 600, marginBottom: 4 }}>SIZE</div>
-        <p style={{ margin: 0, lineHeight: 1.5 }}>{taille?.text || "N/A"}</p>
-      </div>
-    </div>
-  );
-}
-
-function DiagnosisContent({ diagnosis }: { diagnosis: NonNullable<AnalysisResult["diagnosis"]> }) {
-  const diagnostics = diagnosis.diagnostics || [];
-
+function DiagnosisCards({ entries }: { entries: DiagnosisEntry[] }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {diagnostics.map((dx, i) => {
+      {entries.map((dx, i) => {
         const tier = TIER_STYLES[dx.tier] || TIER_STYLES["possible"];
         return (
           <div
@@ -220,42 +179,26 @@ function DiagnosisContent({ diagnosis }: { diagnosis: NonNullable<AnalysisResult
                   borderRadius: 4,
                   background: tier.border,
                   color: "#fff",
+                  whiteSpace: "nowrap",
                 }}
               >
-                #{dx.rank} {tier.label}
+                #{i + 1} {tier.label}
               </span>
               <span style={{ fontSize: 14, fontWeight: 600, color: "#eee" }}>{dx.label}</span>
             </div>
 
-            {/* Supporting features */}
-            {dx.supporting_features?.length > 0 && (
-              <div style={{ marginBottom: 4 }}>
-                <span style={{ fontSize: 11, color: "#6a6", fontWeight: 600 }}>Supporting: </span>
-                <ul style={{ margin: "2px 0 0 16px", padding: 0, fontSize: 12, color: "#bbb", lineHeight: 1.5 }}>
-                  {dx.supporting_features.map((f, j) => (
-                    <li key={j}>{f}</li>
-                  ))}
-                </ul>
+            {dx.supporting && (
+              <div style={{ fontSize: 12, color: "#bbb", lineHeight: 1.5, marginBottom: 4 }}>
+                <span style={{ color: "#6a6", fontWeight: 600 }}>Supporting: </span>
+                {dx.supporting}
               </div>
             )}
 
-            {/* Against features */}
-            {dx.against_features?.length > 0 && dx.against_features[0] !== "" && (
-              <div style={{ marginBottom: 4 }}>
-                <span style={{ fontSize: 11, color: "#a66", fontWeight: 600 }}>Against: </span>
-                <ul style={{ margin: "2px 0 0 16px", padding: 0, fontSize: 12, color: "#999", lineHeight: 1.5 }}>
-                  {dx.against_features.map((f, j) => (
-                    <li key={j}>{f}</li>
-                  ))}
-                </ul>
+            {dx.against && dx.against.toLowerCase() !== "none" && dx.against.toLowerCase() !== "none." && (
+              <div style={{ fontSize: 12, color: "#999", lineHeight: 1.5 }}>
+                <span style={{ color: "#a66", fontWeight: 600 }}>Against: </span>
+                {dx.against}
               </div>
-            )}
-
-            {/* Confidence rationale */}
-            {dx.confidence_rationale && (
-              <p style={{ margin: "4px 0 0", fontSize: 11, color: "#888", fontStyle: "italic" }}>
-                {dx.confidence_rationale}
-              </p>
             )}
           </div>
         );
@@ -264,39 +207,49 @@ function DiagnosisContent({ diagnosis }: { diagnosis: NonNullable<AnalysisResult
   );
 }
 
-function ReasoningContent({ cot }: { cot: Record<string, unknown> }) {
-  // Display as formatted JSON for transparency
-  return (
-    <pre
-      style={{
-        color: "#999",
-        fontSize: 11,
-        fontFamily: "monospace",
-        whiteSpace: "pre-wrap",
-        margin: 0,
-        maxHeight: 400,
-        overflow: "auto",
-        lineHeight: 1.4,
-      }}
-    >
-      {JSON.stringify(cot, null, 2)}
-    </pre>
-  );
-}
+/* ── ROI Data panel — quantitative pipeline data ─────────────────────── */
 
-function Tag({ label, color = "#1a2a3a" }: { label: string; color?: string }) {
+function RoiDataPanel({ data }: { data: RoiData }) {
+  const { density, peri_lesional, morphometry, spatial } = data;
+  const r = (v: number | null | undefined, d = 1) =>
+    v != null ? v.toFixed(d) : "N/A";
+
   return (
-    <span
-      style={{
-        fontSize: 11,
-        padding: "2px 8px",
-        borderRadius: 4,
-        background: color,
-        color: "#aac",
-        border: "1px solid #334",
-      }}
-    >
-      {label}
-    </span>
+    <div style={{ fontSize: 12, color: "#aaa", fontFamily: "monospace", lineHeight: 1.6 }}>
+      {/* Density */}
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ color: "#4a90d9", fontWeight: 600, marginBottom: 2, fontFamily: "sans-serif", fontSize: 11 }}>Density (eroded mask)</div>
+        <div>mean={r(density.mean)} | median={r(density.median)} | sd={r(density.sd)} | min={r(density.min, 0)} | max={r(density.max, 0)}</div>
+        <div>deciles: {density.deciles?.map((v, i) => `P${(i + 1) * 10}=${r(v)}`).join(" | ")}</div>
+        <div>asymmetry={r(density.density_asymmetry)}</div>
+      </div>
+
+      {/* Peri-lesional */}
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ color: "#4a90d9", fontWeight: 600, marginBottom: 2, fontFamily: "sans-serif", fontSize: 11 }}>Peri-lesional ring</div>
+        <div>adjacent mean={r(peri_lesional.mean)} | sd={r(peri_lesional.sd)}</div>
+        <div>
+          delta_hu_median_parenchyma={" "}
+          {peri_lesional.delta_hu_median_parenchyma != null
+            ? `${peri_lesional.delta_hu_median_parenchyma >= 0 ? "+" : ""}${r(peri_lesional.delta_hu_median_parenchyma)}`
+            : "N/A"}
+        </div>
+      </div>
+
+      {/* Morphometry */}
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ color: "#4a90d9", fontWeight: 600, marginBottom: 2, fontFamily: "sans-serif", fontSize: 11 }}>Morphometry (original mask)</div>
+        <div>axes: {r(morphometry.major_axis_mm)} x {r(morphometry.minor_axis_mm)} mm | AR={r(morphometry.aspect_ratio, 2)}</div>
+        <div>area={r(morphometry.area_mm2)} mm2 | perimeter={r(morphometry.perimeter_mm)} mm</div>
+        <div>compactness={r(morphometry.compactness, 2)} | solidity={r(morphometry.solidity, 2)}</div>
+        <div>eroded_area_fraction={r(morphometry.eroded_area_fraction, 2)}</div>
+      </div>
+
+      {/* Spatial */}
+      <div>
+        <div style={{ color: "#4a90d9", fontWeight: 600, marginBottom: 2, fontFamily: "sans-serif", fontSize: 11 }}>Spatial localization</div>
+        <div>laterality: {spatial.laterality} | antero-posterior: {spatial.antero_posterior}</div>
+      </div>
+    </div>
   );
 }

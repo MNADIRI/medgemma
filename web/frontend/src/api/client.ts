@@ -83,6 +83,10 @@ export async function analyzeRoi(
   sliceIndex: number,
   roi: ROI
 ): Promise<AnalysisResult> {
+  // Analysis can take 30-120s on T4 — use a generous timeout
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min
+
   let res: Response;
   try {
     res = await fetch(`${BASE}/analyze`, {
@@ -93,9 +97,16 @@ export async function analyzeRoi(
         slice_index: sliceIndex,
         roi,
       }),
+      signal: controller.signal,
     });
   } catch (e) {
-    throw new Error("Cannot connect to backend for analysis.");
+    clearTimeout(timeout);
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("Analysis timed out (>5 min). The model may be overloaded.");
+    }
+    throw new Error("Cannot connect to backend for analysis. Check that the backend is running.");
+  } finally {
+    clearTimeout(timeout);
   }
 
   if (!res.ok) {

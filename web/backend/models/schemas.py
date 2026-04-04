@@ -80,9 +80,11 @@ class AnalyzeRequest(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    """Structured analysis result with parsed XML blocks from MedGemma."""
-    chain_of_thought: dict | None = None  # parsed CHAIN_OF_THOUGHT JSON
-    report: dict | None = None            # parsed REPORT JSON
-    diagnosis: dict | None = None         # parsed DIAGNOSIS JSON
+    """Structured analysis result: model text + quantitative pipeline data."""
+    localisation: str | None = None       # model's localization text
+    aspect: str | None = None             # model's characterization text
+    diagnosis_text: str | None = None     # model's diagnosis text
+    diagnosis_entries: list[dict] = []    # parsed diagnosis entries
+    roi_data: dict | None = None          # quantitative data from pipeline
     raw_response: str                     # full model output for fallback
     usage: UsageInfo | None = None
