@@ -8,9 +8,10 @@ interface Props {
   disabled: boolean;
   selectedCount: number;
   totalImageCount: number;
+  hasAnalysis?: boolean;
 }
 
-export default function ChatPanel({ messages, onSend, isLoading, disabled, selectedCount, totalImageCount }: Props) {
+export default function ChatPanel({ messages, onSend, isLoading, disabled, selectedCount, totalImageCount, hasAnalysis = false }: Props) {
   const [input, setInput] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -51,7 +52,7 @@ export default function ChatPanel({ messages, onSend, isLoading, disabled, selec
           color: "#ddd",
         }}
       >
-        MedGemma Chat
+        {hasAnalysis ? "Ask further questions" : "MedGemma Chat"}
       </div>
 
       {/* Messages */}
@@ -69,6 +70,8 @@ export default function ChatPanel({ messages, onSend, isLoading, disabled, selec
           <div style={{ color: "#555", textAlign: "center", marginTop: 40, fontSize: 14 }}>
             {disabled
               ? "Upload DICOM files to start chatting"
+              : hasAnalysis
+              ? "Ask follow-up questions about the lesion and analysis"
               : "Select slices and ask MedGemma a question"}
           </div>
         )}
@@ -153,6 +156,8 @@ export default function ChatPanel({ messages, onSend, isLoading, disabled, selec
               ? "Upload DICOM files first..."
               : selectedCount === 0
               ? "Select slices first..."
+              : hasAnalysis
+              ? "Ask a follow-up question about the lesion..."
               : `Ask about ${selectedCount} selected slice${selectedCount > 1 ? "s" : ""}...`
           }
           disabled={disabled || isLoading || selectedCount === 0}

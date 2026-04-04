@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID = "google/medgemma-1.5-4b-it"
 MAX_NEW_TOKENS = 512
+MAX_NEW_TOKENS_ANALYZE = 2048  # Structured analysis needs more tokens for 3 JSON blocks
 # Max *images* per prompt — T4 (15GB) can handle ~4 in bfloat16.
 # Each full slice = 1 image; each ROI crop = 1 additional image.
 MAX_IMAGES_PER_PROMPT = 4
@@ -116,6 +117,47 @@ def _clean_thinking_tokens(text: str) -> str:
     # Remove any remaining <unused*> tags
     text = re.sub(r"<unused\d+>", "", text)
     return text.strip()
+
+
+def _parse_analysis_response(text: str) -> dict[str, Any]:
+    """Parse the structured XML/JSON blocks from MedGemma's analysis response.
+
+    Extracts <CHAIN_OF_THOUGHT>, <REPORT>, and <DIAGNOSIS> blocks,
+    each containing JSON. Returns dict with parsed JSON or None for each block.
+    """
+    import json
+    import re
+
+    result: dict[str, Any] = {
+        "chain_of_thought": None,
+        "report": None,
+        "diagnosis": None,
+    }
+
+    tag_map = {
+        "CHAIN_OF_THOUGHT": "chain_of_thought",
+        "REPORT": "report",
+        "DIAGNOSIS": "diagnosis",
+    }
+
+    for xml_tag, key in tag_map.items():
+        pattern = rf"<{xml_tag}>\s*(.*?)\s*</{xml_tag}>"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            json_str = match.group(1).strip()
+            try:
+                result[key] = json.loads(json_str)
+            except json.JSONDecodeError as exc:
+                logger.warning("Failed to parse <%s> JSON: %s", xml_tag, exc)
+                # Try to fix common issues (trailing commas)
+                cleaned = re.sub(r",\s*([}\]])", r"\1", json_str)
+                try:
+                    result[key] = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    logger.warning("<%s> JSON recovery failed, storing as raw text", xml_tag)
+                    result[key] = {"_raw": json_str}
+
+    return result
 
 
 def _encode_pil_to_data_uri(img: PIL.Image.Image, fmt: str = "jpeg") -> str:
@@ -352,6 +394,206 @@ class MedGemmaService:
         except Exception:
             logger.error("Inference failed:\n%s", traceback.format_exc())
             raise
+
+    # ------------------------------------------------------------------
+    # Analyze (structured lesion analysis — single slice + ROI)
+    # ------------------------------------------------------------------
+
+    def analyze(
+        self,
+        session_id: str,
+        slice_index: int,
+        roi: dict,
+    ) -> dict[str, Any]:
+        """Run structured lesion analysis on a single slice with ROI.
+
+        Uses the full analysis system prompt and returns parsed XML blocks.
+        Returns dict with 'chain_of_thought', 'report', 'diagnosis',
+        'raw_response', and 'usage' keys.
+        """
+        session = self.sessions.get(session_id)
+        if session is None:
+            raise ValueError(f"Unknown session: {session_id}")
+
+        if slice_index < 0 or slice_index >= len(session.images):
+            raise ValueError(f"Slice index {slice_index} out of range")
+
+        messages = self._build_analyze_messages(session, slice_index, roi)
+
+        logger.info("Analyze (%s): slice %d with ROI", self.backend, slice_index)
+
+        try:
+            if self.backend == "remote":
+                result = self._infer_remote_analyze(messages)
+            else:
+                result = self._infer_local_analyze(messages)
+        except Exception:
+            logger.error("Analyze inference failed:\n%s", traceback.format_exc())
+            raise
+
+        # Parse XML blocks from model response
+        raw = result["response"]
+        parsed = _parse_analysis_response(raw)
+
+        return {
+            "chain_of_thought": parsed.get("chain_of_thought"),
+            "report": parsed.get("report"),
+            "diagnosis": parsed.get("diagnosis"),
+            "raw_response": raw,
+            "usage": result["usage"],
+        }
+
+    def _build_analyze_messages(
+        self,
+        session: SessionData,
+        slice_index: int,
+        roi: dict,
+        use_pil: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build messages for structured analysis (system prompt + slice + ROI + ROI data)."""
+        from services.prompts import LESION_ANALYSIS_SYSTEM_PROMPT
+        from services.roi_analysis import extract_roi_data, format_roi_data
+
+        if use_pil is None:
+            use_pil = self.backend != "remote"
+
+        content: list[dict[str, Any]] = []
+
+        # System instruction
+        content.append({"type": "text", "text": LESION_ANALYSIS_SYSTEM_PROMPT})
+
+        def _append_image(img: PIL.Image.Image) -> None:
+            if use_pil:
+                content.append({"type": "image", "image": img})
+            else:
+                content.append({"type": "image", "image": _encode_pil_to_data_uri(img)})
+
+        # Full slice image
+        img = session.images[slice_index]
+        _append_image(img)
+
+        # Segment and isolate ROI
+        display_img = session.display_images[slice_index]
+        mask = None
+
+        if self.medsam2 is not None and self.medsam2.is_loaded:
+            try:
+                mask, isolated_img = self.medsam2.segment_and_isolate(img, display_img, roi)
+                _append_image(isolated_img)
+                logger.info("Analyze: MedSAM2 segmented ROI → isolated %dx%d", isolated_img.width, isolated_img.height)
+            except Exception as exc:
+                logger.warning("Analyze: MedSAM2 failed: %s, falling back to crop", exc)
+                cropped = self._crop_roi(img, roi)
+                _append_image(cropped)
+        else:
+            cropped = self._crop_roi(img, roi)
+            _append_image(cropped)
+
+        # Extract quantitative ROI data
+        roi_data_text = ""
+        if mask is not None and slice_index < len(session.hu_arrays):
+            hu = session.hu_arrays[slice_index]
+            ps = session.pixel_spacings[slice_index]
+            ipp = None
+            iop = None
+            if slice_index < len(session.slice_metadata):
+                smeta = session.slice_metadata[slice_index]
+                ipp = smeta.get("image_position_patient")
+                iop = smeta.get("image_orientation_patient")
+            try:
+                roi_data = extract_roi_data(
+                    hu, mask, ps,
+                    image_position_patient=ipp,
+                    image_orientation_patient=iop,
+                )
+                roi_data_text = format_roi_data(roi_data)
+                logger.info(
+                    "Analyze: ROI data extracted (mean=%.1f HU, area=%.1f mm²)",
+                    roi_data["density"]["mean"],
+                    roi_data["morphometry"]["area_mm2"],
+                )
+            except Exception as exc:
+                logger.warning("Analyze: ROI data extraction failed: %s", exc)
+
+        # Assemble prompt text
+        prompt = "Full CT slice + segmented lesion above."
+        if roi_data_text:
+            prompt += f"\n\n{roi_data_text}"
+        else:
+            prompt += "\n\n(Quantitative ROI data unavailable — analyze visually.)"
+        prompt += "\n\nPerform structured lesion analysis following the methodology above."
+
+        content.append({"type": "text", "text": prompt})
+
+        return [{"role": "user", "content": content}]
+
+    def _infer_local_analyze(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Run local inference for structured analysis (higher token limit)."""
+        import torch
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self.model.device)
+        input_len = inputs["input_ids"].shape[-1]
+        logger.info("Analyze input tokens: %d", input_len)
+
+        with torch.inference_mode():
+            output_ids = self.model.generate(
+                **inputs,
+                do_sample=False,
+                max_new_tokens=MAX_NEW_TOKENS_ANALYZE,
+            )
+
+        new_tokens = output_ids[0, input_len:]
+        response_text = self.processor.decode(new_tokens, skip_special_tokens=True)
+        response_text = _clean_thinking_tokens(response_text)
+        output_len = len(new_tokens)
+        logger.info("Analyze output tokens: %d", output_len)
+
+        return {
+            "response": response_text.strip(),
+            "usage": {"input_tokens": int(input_len), "output_tokens": int(output_len)},
+        }
+
+    def _infer_remote_analyze(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+        """Run remote inference for structured analysis."""
+        openai_messages = []
+        for msg in messages:
+            new_content = []
+            for block in msg["content"]:
+                if block.get("type") == "image":
+                    new_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": block["image"]},
+                    })
+                else:
+                    new_content.append(block)
+            openai_messages.append({"role": msg["role"], "content": new_content})
+
+        kwargs: dict[str, Any] = {
+            "messages": openai_messages,
+            "max_tokens": MAX_NEW_TOKENS_ANALYZE,
+        }
+        if os.environ.get("MEDGEMMA_PROVIDER"):
+            kwargs["model"] = self._remote_model
+        output = self.hf_client.chat_completion(**kwargs)
+
+        choice = output.choices[0]
+        usage = output.usage
+        response_text = choice.message.content or ""
+
+        return {
+            "response": response_text.strip(),
+            "usage": {
+                "input_tokens": usage.prompt_tokens if usage else None,
+                "output_tokens": usage.completion_tokens if usage else None,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Inference backends

@@ -1,4 +1,4 @@
-import type { ChatMessage, ChatResponse, ROI, UploadResponse } from "../types";
+import type { AnalysisResult, ChatMessage, ChatResponse, ROI, UploadResponse } from "../types";
 
 // Backend URL — defaults to localhost, override with VITE_BACKEND_URL for remote (e.g. Colab)
 const BASE = import.meta.env.VITE_BACKEND_URL || "http://localhost:8001/api";
@@ -72,6 +72,43 @@ export async function sendChat(
 
 export function sliceUrl(sessionId: string, index: number): string {
   return `${BASE}/slices/${sessionId}/${index}`;
+}
+
+/**
+ * Run structured lesion analysis on a single slice with ROI.
+ * Returns parsed analysis blocks (report, diagnosis, chain_of_thought).
+ */
+export async function analyzeRoi(
+  sessionId: string,
+  sliceIndex: number,
+  roi: ROI
+): Promise<AnalysisResult> {
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: sessionId,
+        slice_index: sliceIndex,
+        roi,
+      }),
+    });
+  } catch (e) {
+    throw new Error("Cannot connect to backend for analysis.");
+  }
+
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch {
+      detail = res.statusText || detail;
+    }
+    throw new Error(detail);
+  }
+  return res.json();
 }
 
 /**

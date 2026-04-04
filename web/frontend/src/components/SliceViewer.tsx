@@ -15,6 +15,8 @@ interface Props {
   onSelectAll: () => void;
   onDeselectAll: () => void;
   onSetRoi: (index: number, roi: ROI | null) => void;
+  onAnalyze?: (index: number) => void;
+  isAnalyzing?: boolean;
 }
 
 export default function SliceViewer({
@@ -29,6 +31,8 @@ export default function SliceViewer({
   onSelectAll,
   onDeselectAll,
   onSetRoi,
+  onAnalyze,
+  isAnalyzing = false,
 }: Props) {
   const current = slices[currentIndex];
   const isSelected = selectedIndices.has(currentIndex);
@@ -123,6 +127,44 @@ export default function SliceViewer({
           </div>
         )}
       </div>
+
+      {/* Redo / Analyze buttons — shown when mask is visible */}
+      {maskMap.has(currentIndex) && roiMap.has(currentIndex) && (
+        <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+          <button
+            onClick={() => onSetRoi(currentIndex, null)}
+            disabled={isAnalyzing}
+            style={{
+              padding: "8px 20px",
+              borderRadius: 6,
+              border: "1px solid #555",
+              background: "#222",
+              color: "#ccc",
+              cursor: isAnalyzing ? "not-allowed" : "pointer",
+              fontSize: 13,
+              fontWeight: 600,
+            }}
+          >
+            Redo
+          </button>
+          <button
+            onClick={() => onAnalyze?.(currentIndex)}
+            disabled={isAnalyzing || !onAnalyze}
+            style={{
+              padding: "8px 24px",
+              borderRadius: 6,
+              border: "none",
+              background: isAnalyzing ? "#333" : "#2d6a2d",
+              color: "#fff",
+              cursor: isAnalyzing ? "not-allowed" : "pointer",
+              fontSize: 13,
+              fontWeight: 600,
+            }}
+          >
+            {isAnalyzing ? "Analyzing..." : "Analyze"}
+          </button>
+        </div>
+      )}
 
       {/* Slider */}
       <input

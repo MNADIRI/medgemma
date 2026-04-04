@@ -1,8 +1,14 @@
-"""Chat route – sends user message + selected slices to MedGemma."""
+"""Chat and analysis routes – sends user message + selected slices to MedGemma."""
 
 from fastapi import APIRouter, HTTPException, Request
 
-from models.schemas import ChatRequest, ChatResponse, UsageInfo
+from models.schemas import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    ChatRequest,
+    ChatResponse,
+    UsageInfo,
+)
 
 router = APIRouter(prefix="/api", tags=["chat"])
 
@@ -34,3 +40,33 @@ async def chat(request: Request, body: ChatRequest):
 
     usage = UsageInfo(**(result.get("usage") or {}))
     return ChatResponse(response=result["response"], usage=usage)
+
+
+@router.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(request: Request, body: AnalyzeRequest):
+    """Run structured lesion analysis on a single slice with ROI.
+
+    Returns parsed XML blocks (CHAIN_OF_THOUGHT, REPORT, DIAGNOSIS).
+    """
+    service = request.app.state.medgemma
+
+    if service.sessions.get(body.session_id) is None:
+        raise HTTPException(404, "Session not found. Upload DICOM files first.")
+
+    try:
+        result = service.analyze(
+            session_id=body.session_id,
+            slice_index=body.slice_index,
+            roi=body.roi.model_dump(),
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Analysis error: {exc}") from exc
+
+    usage = UsageInfo(**(result.get("usage") or {}))
+    return AnalyzeResponse(
+        chain_of_thought=result.get("chain_of_thought"),
+        report=result.get("report"),
+        diagnosis=result.get("diagnosis"),
+        raw_response=result["raw_response"],
+        usage=usage,
+    )

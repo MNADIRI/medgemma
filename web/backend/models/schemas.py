@@ -67,3 +67,22 @@ class UsageInfo(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     usage: UsageInfo | None = None
+
+
+# ---------------------------------------------------------------------------
+# Analyze (structured lesion analysis)
+# ---------------------------------------------------------------------------
+
+class AnalyzeRequest(BaseModel):
+    session_id: str
+    slice_index: int
+    roi: ROIRegion
+
+
+class AnalyzeResponse(BaseModel):
+    """Structured analysis result with parsed XML blocks from MedGemma."""
+    chain_of_thought: dict | None = None  # parsed CHAIN_OF_THOUGHT JSON
+    report: dict | None = None            # parsed REPORT JSON
+    diagnosis: dict | None = None         # parsed DIAGNOSIS JSON
+    raw_response: str                     # full model output for fallback
+    usage: UsageInfo | None = None
