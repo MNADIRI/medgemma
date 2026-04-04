@@ -29,17 +29,19 @@ async def upload_dicom(request: Request, files: list[UploadFile]):
     except Exception as exc:
         raise HTTPException(422, f"Failed to process DICOM files: {exc}") from exc
 
-    # Store model images, display images, HU arrays, and pixel spacings
+    # Store model images, display images, HU arrays, pixel spacings, and per-slice metadata
     service = request.app.state.medgemma
     model_images = [s.model_image for s in slices]
     display_images = [s.display_image for s in slices]
     hu_arrays = [s.hu_array for s in slices]
     pixel_spacings = [s.pixel_spacing for s in slices]
+    slice_metadata = [s.metadata for s in slices]
     session_id = service.sessions.create(
         model_images, meta,
         display_images=display_images,
         hu_arrays=hu_arrays,
         pixel_spacings=pixel_spacings,
+        slice_metadata=slice_metadata,
     )
 
     # Build response

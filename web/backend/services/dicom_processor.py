@@ -269,6 +269,21 @@ class CTDicomProcessor:
         except (AttributeError, IndexError):
             pixel_spacing = (1.0, 1.0)
 
+        # Extract spatial metadata for patient-coordinate localization
+        image_position_patient = None
+        try:
+            ipp = dcm.ImagePositionPatient
+            image_position_patient = (float(ipp[0]), float(ipp[1]), float(ipp[2]))
+        except (AttributeError, IndexError, TypeError):
+            pass
+
+        image_orientation_patient = None
+        try:
+            iop = dcm.ImageOrientationPatient
+            image_orientation_patient = tuple(float(v) for v in iop)
+        except (AttributeError, IndexError, TypeError):
+            pass
+
         position = _slice_sort_key(dcm)
         return ProcessedSlice(
             index=index,
@@ -280,6 +295,8 @@ class CTDicomProcessor:
             metadata={
                 "instance_number": getattr(dcm, "InstanceNumber", None),
                 "slice_location": getattr(dcm, "SliceLocation", None),
+                "image_position_patient": image_position_patient,
+                "image_orientation_patient": image_orientation_patient,
             },
         )
 

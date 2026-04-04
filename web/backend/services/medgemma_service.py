@@ -63,6 +63,7 @@ class SessionData:
     display_images: list[PIL.Image.Image] = field(default_factory=list)  # display images (grayscale)
     hu_arrays: list = field(default_factory=list)                        # raw HU arrays (np.ndarray float64)
     pixel_spacings: list = field(default_factory=list)                   # (row_mm, col_mm) per slice
+    slice_metadata: list = field(default_factory=list)                   # per-slice DICOM metadata dicts
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -79,6 +80,7 @@ class SessionManager:
         display_images: list[PIL.Image.Image] | None = None,
         hu_arrays: list | None = None,
         pixel_spacings: list | None = None,
+        slice_metadata: list | None = None,
     ) -> str:
         sid = uuid.uuid4().hex
         self._sessions[sid] = SessionData(
@@ -86,6 +88,7 @@ class SessionManager:
             display_images=display_images or images,
             hu_arrays=hu_arrays or [],
             pixel_spacings=pixel_spacings or [],
+            slice_metadata=slice_metadata or [],
             metadata=metadata,
         )
         return sid
@@ -555,8 +558,19 @@ class MedGemmaService:
                         if use_structured_prompt and slice_idx < len(session.hu_arrays):
                             hu = session.hu_arrays[slice_idx]
                             ps = session.pixel_spacings[slice_idx]
+                            # Get spatial DICOM metadata for this slice
+                            ipp = None
+                            iop = None
+                            if slice_idx < len(session.slice_metadata):
+                                smeta = session.slice_metadata[slice_idx]
+                                ipp = smeta.get("image_position_patient")
+                                iop = smeta.get("image_orientation_patient")
                             try:
-                                roi_data = extract_roi_data(hu, mask, ps)
+                                roi_data = extract_roi_data(
+                                    hu, mask, ps,
+                                    image_position_patient=ipp,
+                                    image_orientation_patient=iop,
+                                )
                                 roi_block = format_roi_data(roi_data)
                                 content.append({"type": "text", "text": (
                                     f"SLICE {slice_idx + 1} — full view + segmented lesion above.\n\n"
