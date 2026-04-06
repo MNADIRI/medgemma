@@ -1,9 +1,9 @@
 """DINOv2 + CoDeGraph3D anomaly detection service.
 
 Training-free anomaly detection for 3D CT volumes using:
-  1. DINOv2 ViT-B/14 (HuggingFace) multi-layer feature extraction (3 axes)
+  1. DINOv2 ViT-L/14 (HuggingFace) multi-layer feature extraction (3 axes)
   2. Patch-aligned depth pooling + L2 normalization + axis permutation
-  3. Random projection (768 → 128) per axis per layer, fused to 384-dim
+  3. Random projection (1024 → 64) per axis per layer, fused to 192-dim
   4. Self-referencing K-NN scoring with tissue masking and spatial exclusion
   5. Multi-layer score averaging → 3D anomaly map → per-slice ROI extraction
 
@@ -21,16 +21,16 @@ import PIL.Image
 
 logger = logging.getLogger(__name__)
 
-# ── DINOv2 ViT-B/14 parameters ───────────────────────────────────────────
+# ── DINOv2 ViT-L/14 parameters ───────────────────────────────────────────
 PATCH_SIZE = 14
-EMBED_DIM = 768                       # DINOv2-B hidden_size
-PROJ_DIM = 128                        # random projection target dim
-LAYER_INDICES = [3, 6, 9, 12]        # 4 layers for ViT-B (12 total)
+EMBED_DIM = 1024                      # DINOv2-L hidden_size
+PROJ_DIM = 64                         # random projection target dim (match original)
+LAYER_INDICES = [6, 12, 18, 24]       # 4 layers for ViT-L (24 total)
 TARGET_SIZE = 224                      # resample volume to 224^3
 GRID_DIM = TARGET_SIZE // PATCH_SIZE  # = 16 tokens per axis
 
 # ── Scoring parameters ───────────────────────────────────────────────────
-K_NEIGHBORS = 50
+K_NEIGHBORS = 5
 EXCLUDE_RADIUS = 2
 MIN_COMPONENT_AREA = 50
 ANOMALY_THRESHOLD_SIGMA = 2.0
@@ -50,14 +50,14 @@ class DINOv2CoDeGraphService:
         self.processor = None
         self.encoder_blocks = None
         self._device = None
-        self._proj_matrices: dict[int, np.ndarray] = {}  # layer_idx → (768, 128)
+        self._proj_matrices: dict[int, np.ndarray] = {}  # layer_idx → (1024, 64)
 
     @property
     def is_loaded(self) -> bool:
         return self.model is not None
 
     def load_model(self) -> None:
-        """Load DINOv2 ViT-B/14 via HuggingFace transformers. Called lazily."""
+        """Load DINOv2 ViT-L/14 via HuggingFace transformers. Called lazily."""
         if self.model is not None:
             return
 
@@ -73,16 +73,16 @@ class DINOv2CoDeGraphService:
             return
 
         try:
-            logger.info("Loading DINOv2 ViT-B/14 from HuggingFace...")
+            logger.info("Loading DINOv2 ViT-L/14 from HuggingFace...")
             self.processor = AutoImageProcessor.from_pretrained(
-                "facebook/dinov2-base", use_fast=True
+                "facebook/dinov2-large", use_fast=True
             )
-            model = AutoModel.from_pretrained("facebook/dinov2-base")
+            model = AutoModel.from_pretrained("facebook/dinov2-large")
             model = model.half().eval().cuda()
             self.model = model
             self.encoder_blocks = model.encoder.layer
             self._device = "cuda"
-            logger.info("DINOv2-B loaded on CUDA (fp16, %d layers, %d-dim)",
+            logger.info("DINOv2-L loaded on CUDA (fp16, %d layers, %d-dim)",
                         len(self.encoder_blocks), EMBED_DIM)
         except Exception as exc:
             logger.error("Failed to load DINOv2: %s", exc)
@@ -133,16 +133,35 @@ class DINOv2CoDeGraphService:
         if n_valid < K_NEIGHBORS + 10:
             raise ValueError(f"Too few valid tissue tokens ({n_valid}). Volume may be empty or improperly windowed.")
 
-        # Step 3: Multi-layer feature extraction + scoring
-        layer_scores = []
-        for layer_idx in LAYER_INDICES:
-            logger.info("Processing layer %d/12...", layer_idx)
-            fused = self._extract_and_fuse_layer(volume, layer_idx)  # (GRID_DIM^3, 384)
-            scores = self._knn_scoring(fused, valid_mask)             # (GRID_DIM^3,)
-            layer_scores.append(scores)
+        # Step 3: Multi-axis feature extraction (1 encoding pass per axis, all layers)
+        layer_axis_projs: dict[int, list] = {li: [] for li in LAYER_INDICES}
+
+        for axis_name in ("axial", "coronal", "sagittal"):
+            logger.info("Encoding %s slices (all layers)...", axis_name)
+            slices = self._collect_axis_slices(volume, axis_name)
+            all_layer_tokens = self._encode_slices_all_layers(slices)
+
+            for layer_idx in LAYER_INDICES:
+                tokens = all_layer_tokens[layer_idx]
+                grid_tokens = self._tokens_to_voxel_grid(axis_name, tokens)
+                flat = grid_tokens.reshape(-1, EMBED_DIM)
+                if isinstance(flat, torch.Tensor):
+                    flat = flat.cpu().float().numpy()
+                proj = flat @ self._proj_matrices[layer_idx]
+                layer_axis_projs[layer_idx].append(proj)
+
+            del all_layer_tokens
             torch.cuda.empty_cache()
 
-        # Step 4: Average across layers
+        # Step 4: Per-layer scoring
+        layer_scores = []
+        for layer_idx in LAYER_INDICES:
+            logger.info("Scoring layer %d...", layer_idx)
+            fused = np.concatenate(layer_axis_projs[layer_idx], axis=1).astype(np.float32)
+            scores = self._knn_scoring(fused, valid_mask)
+            layer_scores.append(scores)
+
+        # Step 5: Average across layers
         final_scores = np.mean(layer_scores, axis=0)  # (GRID_DIM^3,)
         final_scores[~valid_mask] = 0.0
 
@@ -152,11 +171,11 @@ class DINOv2CoDeGraphService:
             normalized = (valid_vals - valid_vals.min()) / (valid_vals.max() - valid_vals.min())
             final_scores[valid_mask] = normalized
 
-        # Step 5: Reshape to 3D grid and upsample to original resolution
+        # Step 6: Reshape to 3D grid and upsample to original resolution
         score_grid = final_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
         anomaly_volume = self._upsample_to_original(score_grid, orig_shape, zoom_factors)
 
-        # Step 6: Per-slice ROI extraction
+        # Step 7: Per-slice ROI extraction
         slice_scores, auto_rois, top_slices = self._extract_rois(anomaly_volume)
 
         logger.info("Anomaly detection complete: %d auto-ROIs, top slices: %s",
@@ -203,43 +222,6 @@ class DINOv2CoDeGraphService:
 
     # ── Feature extraction ────────────────────────────────────────────────
 
-    def _extract_and_fuse_layer(self, volume: np.ndarray, layer_idx: int) -> np.ndarray:
-        """Extract features for one DINOv2 layer from all 3 axes and fuse.
-
-        Args:
-            volume: (224, 224, 224) float [0, 1]
-            layer_idx: which encoder layer to extract from
-
-        Returns:
-            (GRID_DIM^3, 3*PROJ_DIM) fused projected tokens
-        """
-        import torch
-
-        axes = ("axial", "coronal", "sagittal")
-        proj_matrix = self._proj_matrices[layer_idx]
-        voxel_components = []
-
-        for axis_name in axes:
-            # Collect all slices along this axis
-            slices = self._collect_axis_slices(volume, axis_name)
-
-            # Extract tokens from DINOv2 at this layer
-            tokens = self._encode_slices(slices, layer_idx)  # (N_slices, 16*16, 768) tensor
-
-            # Pool along depth, L2-normalize, permute to common grid
-            grid_tokens = self._tokens_to_voxel_grid(axis_name, tokens)  # (16, 16, 16, 768)
-
-            # Random projection
-            flat = grid_tokens.reshape(-1, EMBED_DIM)  # (4096, 768)
-            if isinstance(flat, torch.Tensor):
-                flat = flat.cpu().float().numpy()
-            proj = flat @ proj_matrix  # (4096, 128)
-            voxel_components.append(proj)
-
-        # Concatenate all axes → 384-dim
-        fused = np.concatenate(voxel_components, axis=1)  # (4096, 384)
-        return fused.astype(np.float32)
-
     def _collect_axis_slices(self, volume: np.ndarray, axis: str) -> list:
         """Collect ALL 2D slices along an axis from (D, H, W) volume."""
         if axis == "axial":
@@ -251,20 +233,22 @@ class DINOv2CoDeGraphService:
         else:
             raise ValueError(f"Unknown axis: {axis}")
 
-    def _encode_slices(self, slice_list: list, layer_idx: int):
-        """Extract DINOv2 tokens at a specific layer for a list of 2D grayscale slices.
+    def _encode_slices_all_layers(self, slice_list: list) -> dict:
+        """Extract DINOv2 tokens at ALL layers for a list of 2D grayscale slices.
+
+        Registers hooks on all layers in LAYER_INDICES simultaneously so only
+        one forward pass per batch is needed (3 passes total for 3 axes).
 
         Args:
             slice_list: list of (H, W) float [0, 1] arrays (224x224)
-            layer_idx: encoder layer index (1-based)
 
         Returns:
-            torch.Tensor of shape (N_slices, n_patches, embed_dim)
+            dict[layer_idx → torch.Tensor of shape (N_slices, n_patches, EMBED_DIM)]
         """
         import torch
 
-        all_tokens = []
-        batch_size = 16  # 224x224 slices are small, can batch more
+        all_tokens: dict[int, list] = {li: [] for li in LAYER_INDICES}
+        batch_size = 16
 
         for i in range(0, len(slice_list), batch_size):
             batch_slices = slice_list[i:i + batch_size]
@@ -279,7 +263,7 @@ class DINOv2CoDeGraphService:
             inputs = self.processor(
                 images=pil_imgs,
                 return_tensors="pt",
-                do_resize=False,       # already 224x224
+                do_resize=False,
                 do_center_crop=False,
                 do_pad=False,
                 do_rescale=self.processor.do_rescale,
@@ -287,27 +271,36 @@ class DINOv2CoDeGraphService:
             )
             inputs = {k: v.cuda().half() for k, v in inputs.items()}
 
-            # Register hook on target layer
-            captured = {}
+            # Register hooks on ALL target layers simultaneously
+            captured: dict[int, Any] = {}
+            handles = []
 
-            def hook_fn(module, input, output):
-                captured["state"] = output
+            def make_hook(li: int):
+                def hook_fn(module, inp, output):
+                    captured[li] = output
+                return hook_fn
 
-            handle = self.encoder_blocks[layer_idx - 1].register_forward_hook(hook_fn)
+            for layer_idx in LAYER_INDICES:
+                h = self.encoder_blocks[layer_idx - 1].register_forward_hook(
+                    make_hook(layer_idx)
+                )
+                handles.append(h)
 
             with torch.inference_mode(), torch.amp.autocast("cuda"):
                 self.model(**inputs)
 
-            handle.remove()
+            for h in handles:
+                h.remove()
 
-            # Extract patch tokens (skip CLS)
-            hidden = captured["state"]
-            if isinstance(hidden, (tuple, list)):
-                hidden = hidden[0]
-            tokens = hidden[:, 1:, :]  # (B, n_patches, 768)
-            all_tokens.append(tokens)
+            # Extract patch tokens (skip CLS) for each layer
+            for layer_idx in LAYER_INDICES:
+                hidden = captured[layer_idx]
+                if isinstance(hidden, (tuple, list)):
+                    hidden = hidden[0]
+                tokens = hidden[:, 1:, :]  # (B, n_patches, EMBED_DIM)
+                all_tokens[layer_idx].append(tokens)
 
-        return torch.cat(all_tokens, dim=0)  # (N_slices, n_patches, 768)
+        return {li: torch.cat(all_tokens[li], dim=0) for li in LAYER_INDICES}
 
     def _tokens_to_voxel_grid(self, axis_name: str, tokens):
         """Pool along depth, L2-normalize, and permute to common (x,y,z) frame.
@@ -333,13 +326,17 @@ class DINOv2CoDeGraphService:
         side = int(np.sqrt(n_patches_per_slice))  # should be 16 for 224/14
         grid = pooled.view(d, side, side, -1)
 
-        # Permute to common coordinate system
+        # Permute to common (Z, Y, X, C) coordinate system.
+        # Our volume is (Z, Y, X) = (N_slices, H_rows, W_cols).
+        # Axial slices vol[i,:,:] → 2D image (Y, X) → grid (d_Z, h_Y, w_X, C) = already (Z,Y,X,C)
+        # Coronal slices vol[:,i,:] → 2D image (Z, X) → grid (d_Y, h_Z, w_X, C) → permute to (Z,Y,X,C)
+        # Sagittal slices vol[:,:,i] → 2D image (Z, Y) → grid (d_X, h_Z, w_Y, C) → permute to (Z,Y,X,C)
         if axis_name == "axial":
-            return grid.permute(1, 2, 0, 3)   # (h, w, z, C)
+            return grid                         # (d_Z, h_Y, w_X, C) = (Z, Y, X, C)
         elif axis_name == "coronal":
-            return grid.permute(1, 0, 2, 3)   # (h, z, w, C)
+            return grid.permute(1, 0, 2, 3)   # (d_Y, h_Z, w_X) → (Z, Y, X, C)
         elif axis_name == "sagittal":
-            return grid                         # already (z, h, w, C) — identity
+            return grid.permute(1, 2, 0, 3)   # (d_X, h_Z, w_Y) → (Z, Y, X, C)
         else:
             raise ValueError(f"Unknown axis: {axis_name}")
 
