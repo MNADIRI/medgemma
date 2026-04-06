@@ -66,6 +66,7 @@ class SessionData:
     pixel_spacings: list = field(default_factory=list)                   # (row_mm, col_mm) per slice
     slice_metadata: list = field(default_factory=list)                   # per-slice DICOM metadata dicts
     metadata: dict[str, Any] = field(default_factory=dict)
+    anomaly_result: dict | None = None                                   # DINOv2+CoDeGraph3D anomaly detection result
 
 
 class SessionManager:

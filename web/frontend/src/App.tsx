@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { analyzeRoi, segmentRoi, uploadDicom } from "./api/client";
+import { analyzeRoi, detectAnomaly, segmentRoi, uploadDicom } from "./api/client";
 import AnalysisPanel from "./components/AnalysisPanel";
 import ChatPanel from "./components/ChatPanel";
 import DicomDropZone from "./components/DicomDropZone";
 import SliceViewer from "./components/SliceViewer";
 import { useChat } from "./hooks/useChat";
-import type { AnalysisResult, ROI, SeriesMetadata, SliceInfo } from "./types";
+import type { AnalysisResult, AnomalyResult, ROI, SeriesMetadata, SliceInfo } from "./types";
 
 export default function App() {
   // Session state
@@ -25,6 +25,12 @@ export default function App() {
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
+
+  // Anomaly detection state
+  const [anomalyResult, setAnomalyResult] = useState<AnomalyResult | null>(null);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [detectError, setDetectError] = useState<string | null>(null);
+  const [showHeatmap, setShowHeatmap] = useState(true);
 
   // Chat — carries analysis context for follow-up questions
   const { messages, isLoading, send, reset } = useChat(sessionId, selectedIndices, roiMap);
@@ -69,6 +75,8 @@ export default function App() {
       });
       setAnalysisResult(null);
       setAnalysisError(null);
+      setAnomalyResult(null);
+      setDetectError(null);
       reset();
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Upload failed";
@@ -162,6 +170,50 @@ export default function App() {
     }
   }, [sessionId, roiMap]);
 
+  const handleDetectAnomaly = useCallback(async () => {
+    if (!sessionId) return;
+    setIsDetecting(true);
+    setDetectError(null);
+    setAnomalyResult(null);
+
+    try {
+      const result = await detectAnomaly(sessionId);
+      setAnomalyResult(result);
+      setShowHeatmap(true);
+
+      // Navigate to the top anomaly slice and auto-select it
+      if (result.top_slices.length > 0) {
+        const topSlice = result.top_slices[0];
+        setCurrentIndex(topSlice);
+        setSelectedIndices((prev) => {
+          const next = new Set(prev);
+          next.add(topSlice);
+          return next;
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Anomaly detection failed";
+      setDetectError(msg);
+    } finally {
+      setIsDetecting(false);
+    }
+  }, [sessionId]);
+
+  const handleAcceptAutoRoi = useCallback((sliceIndex: number) => {
+    if (!anomalyResult) return;
+    const roi = anomalyResult.auto_rois[String(sliceIndex)];
+    if (!roi) return;
+
+    // Select the slice and set the ROI (triggers MedSAM2 segmentation via handleSetRoi)
+    setSelectedIndices((prev) => {
+      const next = new Set(prev);
+      next.add(sliceIndex);
+      return next;
+    });
+    // Use setTimeout to ensure selection state is set before ROI
+    setTimeout(() => handleSetRoi(sliceIndex, roi), 0);
+  }, [anomalyResult, handleSetRoi]);
+
   return (
     <div
       style={{
@@ -232,6 +284,13 @@ export default function App() {
                 onSetRoi={handleSetRoi}
                 onAnalyze={handleAnalyze}
                 isAnalyzing={isAnalyzing}
+                anomalyResult={anomalyResult}
+                isDetecting={isDetecting}
+                detectError={detectError}
+                showHeatmap={showHeatmap}
+                onDetectAnomaly={handleDetectAnomaly}
+                onToggleHeatmap={() => setShowHeatmap((v) => !v)}
+                onAcceptAutoRoi={handleAcceptAutoRoi}
               />
               <DicomDropZone onUpload={handleUpload} isUploading={isUploading} />
             </>

@@ -88,3 +88,25 @@ class AnalyzeResponse(BaseModel):
     roi_data: dict | None = None          # quantitative data from pipeline
     raw_response: str                     # full model output for fallback
     usage: UsageInfo | None = None
+
+
+# ---------------------------------------------------------------------------
+# Anomaly Detection (DINOv2 + CoDeGraph3D)
+# ---------------------------------------------------------------------------
+
+class DetectAnomalyRequest(BaseModel):
+    session_id: str
+
+
+class AutoROI(BaseModel):
+    x: float
+    y: float
+    width: float
+    height: float
+
+
+class DetectAnomalyResponse(BaseModel):
+    """Result of DINOv2+CoDeGraph3D anomaly detection."""
+    top_slices: list[int]                      # top-K slices by anomaly score
+    auto_rois: dict[str, AutoROI]              # slice_index (as str) → ROI
+    slice_scores: list[float]                  # per-slice max anomaly score

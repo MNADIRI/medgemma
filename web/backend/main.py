@@ -7,7 +7,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import chat, dicom
+from routers import anomaly, chat, dicom
+from services.dinov2_codegraph_service import DINOv2CoDeGraphService
 from services.medgemma_service import MedGemmaService
 from services.medsam2_service import MedSAM2Service
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 medgemma = MedGemmaService()
 medsam2 = MedSAM2Service()
+dinov2_codegraph = DINOv2CoDeGraphService()
 
 
 @asynccontextmanager
@@ -28,7 +30,10 @@ async def lifespan(app: FastAPI):
     app.state.medsam2 = medsam2
     medgemma.medsam2 = medsam2  # Allow chat pipeline to use segmentation
 
-    logger.info("Services ready (MedGemma=%s, MedSAM2=%s)",
+    # DINOv2 loads lazily on first /detect-anomaly call (saves VRAM at startup)
+    app.state.dinov2_codegraph = dinov2_codegraph
+
+    logger.info("Services ready (MedGemma=%s, MedSAM2=%s, DINOv2=lazy)",
                 medgemma.backend, "loaded" if medsam2.is_loaded else "disabled")
     yield
     logger.info("Shutting down")
@@ -50,6 +55,7 @@ app.add_middleware(
 
 app.include_router(dicom.router)
 app.include_router(chat.router)
+app.include_router(anomaly.router)
 
 
 @app.get("/api/health")
@@ -60,6 +66,7 @@ async def health():
         "backend": medgemma.backend,
         "model_loaded": ready,
         "medsam2_loaded": medsam2.is_loaded,
+        "dinov2_loaded": dinov2_codegraph.is_loaded,
     }
 
 

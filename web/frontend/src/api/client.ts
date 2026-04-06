@@ -1,4 +1,4 @@
-import type { AnalysisResult, ChatMessage, ChatResponse, ROI, UploadResponse } from "../types";
+import type { AnalysisResult, AnomalyResult, ChatMessage, ChatResponse, ROI, UploadResponse } from "../types";
 
 // Backend URL — defaults to localhost, override with VITE_BACKEND_URL for remote (e.g. Colab)
 const BASE = import.meta.env.VITE_BACKEND_URL || "http://localhost:8001/api";
@@ -147,4 +147,49 @@ export async function segmentRoi(
   } catch {
     return null; // Network error, graceful fallback
   }
+}
+
+/**
+ * Run DINOv2 + CoDeGraph3D anomaly detection on the full CT volume.
+ * Returns top anomaly slices and auto-generated ROIs.
+ */
+export async function detectAnomaly(sessionId: string): Promise<AnomalyResult> {
+  // Anomaly detection can take 15-60s — use a generous timeout
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min
+
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}/detect-anomaly`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    clearTimeout(timeout);
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error("Anomaly detection timed out (>5 min).");
+    }
+    throw new Error("Cannot connect to backend for anomaly detection.");
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch {
+      detail = res.statusText || detail;
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+/** URL for the anomaly heatmap overlay PNG for a specific slice. */
+export function anomalyHeatmapUrl(sessionId: string, index: number): string {
+  return `${BASE}/anomaly-heatmap/${sessionId}/${index}`;
 }

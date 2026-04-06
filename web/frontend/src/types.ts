@@ -94,3 +94,11 @@ export interface AnalysisResult {
   raw_response: string;
   usage: { input_tokens: number | null; output_tokens: number | null } | null;
 }
+
+// ── Anomaly detection types ───────────────────────────────────────────
+
+export interface AnomalyResult {
+  top_slices: number[];
+  auto_rois: Record<string, ROI>;  // key = slice index as string
+  slice_scores: number[];
+}
