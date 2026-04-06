@@ -1,14 +1,15 @@
 """DINOv2 + CoDeGraph3D anomaly detection service.
 
-Training-free, zero-shot anomaly detection for 3D CT volumes using:
-  1. DINOv2 ViT-B/14 frozen feature extraction (multi-axis)
-  2. Patch-aligned cubic pooling → 3D voxel tokens
-  3. Gaussian random projection (768 → 128) per axis, fused to 384-dim
-  4. Self-referencing K-NN mutual scoring via FAISS
-  5. 3D anomaly map → per-slice ROI extraction
+Training-free anomaly detection for 3D CT volumes using:
+  1. DINOv2 ViT-B/14 (HuggingFace) multi-layer feature extraction (3 axes)
+  2. Patch-aligned depth pooling + L2 normalization + axis permutation
+  3. Random projection (768 → 128) per axis per layer, fused to 384-dim
+  4. Self-referencing K-NN scoring with tissue masking and spatial exclusion
+  5. Multi-layer score averaging → 3D anomaly map → per-slice ROI extraction
 
-Works without any training data — compares tokens within the same volume,
-exploiting the symmetry and repetitiveness of normal tissue.
+Adapted from CoDeGraph3D (arxiv 2602.15315) for single-volume use.
+The cross-volume MSM graph is not applicable to single-volume; instead we use
+self-referencing K-NN exploiting brain CT bilateral symmetry.
 """
 
 import io
@@ -20,40 +21,51 @@ import PIL.Image
 
 logger = logging.getLogger(__name__)
 
-# DINOv2 ViT-B/14 parameters
+# ── DINOv2 ViT-B/14 parameters ───────────────────────────────────────────
 PATCH_SIZE = 14
-INPUT_SIZE = 518  # 37 * 14 = 518 → 37x37 patch grid
-GRID_SIZE = 37    # INPUT_SIZE // PATCH_SIZE
-EMBED_DIM = 768
-PROJ_DIM = 128
+EMBED_DIM = 768                       # DINOv2-B hidden_size
+PROJ_DIM = 128                        # random projection target dim
+LAYER_INDICES = [3, 6, 9, 12]        # 4 layers for ViT-B (12 total)
+TARGET_SIZE = 224                      # resample volume to 224^3
+GRID_DIM = TARGET_SIZE // PATCH_SIZE  # = 16 tokens per axis
+
+# ── Scoring parameters ───────────────────────────────────────────────────
 K_NEIGHBORS = 50
 EXCLUDE_RADIUS = 2
-MIN_COMPONENT_AREA = 50   # minimum voxels for a valid anomaly region
-ANOMALY_THRESHOLD_SIGMA = 2.0  # mean + N*std threshold
+MIN_COMPONENT_AREA = 50
+ANOMALY_THRESHOLD_SIGMA = 2.0
 TOP_K_SLICES = 5
+
+# ── CT windowing ─────────────────────────────────────────────────────────
+HU_MIN = -135   # soft-tissue window low
+HU_MAX = 215    # soft-tissue window high
+TISSUE_HU_THRESHOLD = -200  # air/background threshold
 
 
 class DINOv2CoDeGraphService:
-    """Lazy-loaded DINOv2 + CoDeGraph3D anomaly detector for CT volumes."""
+    """Lazy-loaded DINOv2 + self-referencing anomaly detector for CT volumes."""
 
     def __init__(self) -> None:
         self.model = None
+        self.processor = None
+        self.encoder_blocks = None
         self._device = None
-        self._proj_matrices: dict[str, np.ndarray] = {}  # axis → (768, 128)
+        self._proj_matrices: dict[int, np.ndarray] = {}  # layer_idx → (768, 128)
 
     @property
     def is_loaded(self) -> bool:
         return self.model is not None
 
     def load_model(self) -> None:
-        """Load DINOv2 ViT-B/14 via torch.hub. Called lazily on first use."""
+        """Load DINOv2 ViT-B/14 via HuggingFace transformers. Called lazily."""
         if self.model is not None:
             return
 
         try:
             import torch
+            from transformers import AutoImageProcessor, AutoModel
         except ImportError:
-            logger.error("PyTorch not available — DINOv2 disabled")
+            logger.error("PyTorch or transformers not available — DINOv2 disabled")
             return
 
         if not torch.cuda.is_available():
@@ -61,374 +73,387 @@ class DINOv2CoDeGraphService:
             return
 
         try:
-            logger.info("Loading DINOv2 ViT-B/14 via torch.hub...")
-            model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+            logger.info("Loading DINOv2 ViT-B/14 from HuggingFace...")
+            self.processor = AutoImageProcessor.from_pretrained(
+                "facebook/dinov2-base", use_fast=True
+            )
+            model = AutoModel.from_pretrained("facebook/dinov2-base")
             model = model.half().eval().cuda()
             self.model = model
+            self.encoder_blocks = model.encoder.layer
             self._device = "cuda"
-            logger.info("DINOv2 loaded on CUDA (fp16, ~340MB VRAM)")
+            logger.info("DINOv2-B loaded on CUDA (fp16, %d layers, %d-dim)",
+                        len(self.encoder_blocks), EMBED_DIM)
         except Exception as exc:
             logger.error("Failed to load DINOv2: %s", exc)
             self.model = None
             return
 
-        # Initialize fixed random projection matrices (one per axis)
-        rng = np.random.RandomState(42)
-        for axis in ("axial", "coronal", "sagittal"):
-            # Gaussian random projection (Johnson-Lindenstrauss)
+        # Initialize random projection matrices — one per layer
+        for layer_idx in LAYER_INDICES:
+            rng = np.random.RandomState(42 + layer_idx)
             mat = rng.randn(EMBED_DIM, PROJ_DIM).astype(np.float32)
+            # Column-normalize then JL scaling
             mat /= np.linalg.norm(mat, axis=0, keepdims=True)
-            self._proj_matrices[axis] = mat
+            mat *= 1.0 / np.sqrt(PROJ_DIM)
+            self._proj_matrices[layer_idx] = mat
+
+    # ── Main pipeline ─────────────────────────────────────────────────────
 
     def detect_anomaly(self, session_data: Any) -> dict:
         """Run full anomaly detection pipeline on a session's CT volume.
 
         Args:
-            session_data: SessionData with .images (RGB PIL), .pixel_spacings,
-                         .slice_metadata
+            session_data: SessionData with .hu_arrays, .pixel_spacings, .metadata
 
         Returns:
-            dict with keys: anomaly_volume, slice_scores, auto_rois, top_slices
+            dict with anomaly_volume, slice_scores, auto_rois, top_slices
         """
+        import torch
+        import torch.nn.functional as F
+
         self.load_model()
         if not self.is_loaded:
             raise RuntimeError("DINOv2 model not available")
 
-        images = session_data.images  # list of PIL RGB images
-        if not images:
-            raise ValueError("No images in session")
+        # Step 1: Prepare volume — HU windowing, tissue mask, resample to 224^3
+        volume, tissue_mask, orig_shape, zoom_factors = self._prepare_volume(session_data)
+        logger.info("Volume prepared: %s → (224,224,224), tissue coverage: %.1f%%",
+                     orig_shape, tissue_mask.mean() * 100)
 
-        n_slices = len(images)
-        h_orig, w_orig = images[0].size[1], images[0].size[0]  # PIL is (W, H)
+        # Step 2: Build token-level tissue mask
+        mask_tensor = torch.from_numpy(tissue_mask.astype(np.float32))
+        mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
+        pooled_mask = F.max_pool3d(mask_tensor, kernel_size=PATCH_SIZE, stride=PATCH_SIZE)
+        valid_mask = (pooled_mask.squeeze() > 0).view(-1).numpy()  # (GRID_DIM^3,)
+        n_valid = valid_mask.sum()
+        logger.info("Token mask: %d/%d valid tokens (%.1f%%)",
+                     n_valid, valid_mask.size, n_valid / valid_mask.size * 100)
 
-        # Get voxel spacing for block depth computation
-        slice_thickness = self._get_slice_thickness(session_data)
-        pixel_spacing_xy = self._get_pixel_spacing_xy(session_data)
+        if n_valid < K_NEIGHBORS + 10:
+            raise ValueError(f"Too few valid tissue tokens ({n_valid}). Volume may be empty or improperly windowed.")
 
-        # Step 1: Multi-axis feature extraction
-        logger.info("Extracting DINOv2 features for %d slices (3 axes)...", n_slices)
-        axial_tokens = self._extract_axial_features(images)  # (N, 37, 37, 768)
+        # Step 3: Multi-layer feature extraction + scoring
+        layer_scores = []
+        for layer_idx in LAYER_INDICES:
+            logger.info("Processing layer %d/12...", layer_idx)
+            fused = self._extract_and_fuse_layer(volume, layer_idx)  # (GRID_DIM^3, 384)
+            scores = self._knn_scoring(fused, valid_mask)             # (GRID_DIM^3,)
+            layer_scores.append(scores)
+            torch.cuda.empty_cache()
 
-        # Build 3D volume array for coronal/sagittal extraction
-        volume_rgb = self._images_to_volume(images)  # (N, H, W, 3)
+        # Step 4: Average across layers
+        final_scores = np.mean(layer_scores, axis=0)  # (GRID_DIM^3,)
+        final_scores[~valid_mask] = 0.0
 
-        coronal_tokens = self._extract_reformat_features(volume_rgb, axis="coronal")
-        sagittal_tokens = self._extract_reformat_features(volume_rgb, axis="sagittal")
+        # Normalize valid scores to [0, 1]
+        valid_vals = final_scores[valid_mask]
+        if valid_vals.max() > valid_vals.min():
+            normalized = (valid_vals - valid_vals.min()) / (valid_vals.max() - valid_vals.min())
+            final_scores[valid_mask] = normalized
 
-        # Step 2: Cubic pooling — pool along the depth axis to match spatial resolution
-        block_depth = max(1, round(PATCH_SIZE * pixel_spacing_xy / max(slice_thickness, 0.1)))
-        logger.info("Cubic pooling: block_depth=%d (spacing_xy=%.2f, thickness=%.2f)",
-                     block_depth, pixel_spacing_xy, slice_thickness)
+        # Step 5: Reshape to 3D grid and upsample to original resolution
+        score_grid = final_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
+        anomaly_volume = self._upsample_to_original(score_grid, orig_shape, zoom_factors)
 
-        axial_pooled = self._pool_along_depth(axial_tokens, block_depth)  # (D, 37, 37, 768)
-        D_ax = axial_pooled.shape[0]
-
-        # For coronal/sagittal, pool spatially to align to same grid
-        coronal_pooled = self._align_to_grid(coronal_tokens, target_shape=(D_ax, GRID_SIZE, GRID_SIZE))
-        sagittal_pooled = self._align_to_grid(sagittal_tokens, target_shape=(D_ax, GRID_SIZE, GRID_SIZE))
-
-        # Step 3: Random projection per axis (768 → 128)
-        ax_proj = axial_pooled.reshape(-1, EMBED_DIM) @ self._proj_matrices["axial"]
-        co_proj = coronal_pooled.reshape(-1, EMBED_DIM) @ self._proj_matrices["coronal"]
-        sa_proj = sagittal_pooled.reshape(-1, EMBED_DIM) @ self._proj_matrices["sagittal"]
-
-        # Step 4: Multi-view fusion → 384-dim
-        n_tokens = ax_proj.shape[0]
-        fused = np.concatenate([ax_proj, co_proj, sa_proj], axis=1)  # (N_tokens, 384)
-        logger.info("Fused tokens: %d tokens x %d dim", fused.shape[0], fused.shape[1])
-
-        # Step 5: FAISS K-NN mutual scoring
-        scores = self._knn_mutual_scoring(fused, D_ax, GRID_SIZE, GRID_SIZE)
-
-        # Step 6: Reshape to 3D grid and upsample
-        score_grid = scores.reshape(D_ax, GRID_SIZE, GRID_SIZE)
-        anomaly_volume = self._upsample_to_volume(score_grid, n_slices, h_orig, w_orig)
-
-        # Step 7: Per-slice ROI extraction
+        # Step 6: Per-slice ROI extraction
         slice_scores, auto_rois, top_slices = self._extract_rois(anomaly_volume)
 
         logger.info("Anomaly detection complete: %d auto-ROIs, top slices: %s",
                      len(auto_rois), top_slices)
 
         return {
-            "anomaly_volume": anomaly_volume,  # (N, H, W) float32
-            "slice_scores": slice_scores,       # list[float]
-            "auto_rois": auto_rois,             # dict[int, {x, y, width, height}]
-            "top_slices": top_slices,            # list[int]
+            "anomaly_volume": anomaly_volume,
+            "slice_scores": slice_scores,
+            "auto_rois": auto_rois,
+            "top_slices": top_slices,
         }
 
-    # ── Feature extraction ────────────────────────────────────────────────
+    # ── Volume preparation ────────────────────────────────────────────────
 
-    def _extract_axial_features(self, images: list[PIL.Image.Image]) -> np.ndarray:
-        """Extract DINOv2 patch tokens for all axial slices.
+    def _prepare_volume(self, session_data: Any):
+        """Convert HU arrays to windowed [0,1] volume + tissue mask, resampled to 224^3.
 
-        Returns: (N_slices, GRID_SIZE, GRID_SIZE, EMBED_DIM)
-        """
-        import torch
-
-        all_tokens = []
-        batch_size = 8  # Process in batches to limit VRAM
-
-        for i in range(0, len(images), batch_size):
-            batch_imgs = images[i:i + batch_size]
-            tensors = []
-            for img in batch_imgs:
-                t = self._preprocess_image(img)
-                tensors.append(t)
-
-            batch = torch.stack(tensors).cuda()  # (B, 3, 518, 518) fp16
-
-            with torch.inference_mode():
-                out = self.model.forward_features(batch)
-                patch_tokens = out["x_norm_patchtokens"]  # (B, 37*37, 768)
-
-            tokens_np = patch_tokens.cpu().float().numpy()  # (B, 1369, 768)
-            tokens_np = tokens_np.reshape(-1, GRID_SIZE, GRID_SIZE, EMBED_DIM)
-            all_tokens.append(tokens_np)
-
-        return np.concatenate(all_tokens, axis=0)  # (N, 37, 37, 768)
-
-    def _extract_reformat_features(self, volume: np.ndarray, axis: str) -> np.ndarray:
-        """Extract DINOv2 features from coronal or sagittal reformats.
-
-        Args:
-            volume: (N, H, W, 3) uint8 RGB volume
-            axis: "coronal" or "sagittal"
-
-        Returns: (N_slices_along_axis, GRID_SIZE, GRID_SIZE, EMBED_DIM)
-        """
-        import torch
-
-        # Reformat volume along the requested axis
-        if axis == "coronal":
-            # Coronal: iterate over rows (Y axis)
-            n_reformats = volume.shape[1]
-            get_slice = lambda idx: volume[:, idx, :, :]  # (N_z, W, 3)
-        elif axis == "sagittal":
-            # Sagittal: iterate over columns (X axis)
-            n_reformats = volume.shape[2]
-            get_slice = lambda idx: volume[:, :, idx, :]  # (N_z, H, 3)
-        else:
-            raise ValueError(f"Unknown axis: {axis}")
-
-        # Subsample reformats to keep computation manageable
-        # Target ~GRID_SIZE reformats to match spatial resolution
-        step = max(1, n_reformats // GRID_SIZE)
-        indices = list(range(0, n_reformats, step))[:GRID_SIZE]
-
-        all_tokens = []
-        batch_size = 8
-
-        for i in range(0, len(indices), batch_size):
-            batch_indices = indices[i:i + batch_size]
-            tensors = []
-
-            for idx in batch_indices:
-                reformat = get_slice(idx)  # (depth, width_or_height, 3)
-                img = PIL.Image.fromarray(reformat.astype(np.uint8), "RGB")
-                t = self._preprocess_image(img)
-                tensors.append(t)
-
-            batch = torch.stack(tensors).cuda()
-
-            with torch.inference_mode():
-                out = self.model.forward_features(batch)
-                patch_tokens = out["x_norm_patchtokens"]
-
-            tokens_np = patch_tokens.cpu().float().numpy()
-            tokens_np = tokens_np.reshape(-1, GRID_SIZE, GRID_SIZE, EMBED_DIM)
-            all_tokens.append(tokens_np)
-
-        return np.concatenate(all_tokens, axis=0)
-
-    def _preprocess_image(self, img: PIL.Image.Image):
-        """Resize and normalize a PIL image for DINOv2 (returns fp16 tensor)."""
-        import torch
-        import torchvision.transforms.functional as TF
-
-        img_resized = img.resize((INPUT_SIZE, INPUT_SIZE), PIL.Image.BILINEAR)
-        if img_resized.mode != "RGB":
-            img_resized = img_resized.convert("RGB")
-
-        t = TF.to_tensor(img_resized)  # (3, 518, 518) float32 [0,1]
-        t = TF.normalize(t, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        return t.half()
-
-    def _images_to_volume(self, images: list[PIL.Image.Image]) -> np.ndarray:
-        """Convert list of PIL RGB images to (N, H, W, 3) uint8 array."""
-        arrays = []
-        # Use a common size (the first image's size)
-        target_size = images[0].size  # (W, H)
-        for img in images:
-            if img.size != target_size:
-                img = img.resize(target_size, PIL.Image.BILINEAR)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            arrays.append(np.array(img))
-        return np.stack(arrays)  # (N, H, W, 3)
-
-    # ── Pooling and alignment ─────────────────────────────────────────────
-
-    def _pool_along_depth(self, tokens: np.ndarray, block_depth: int) -> np.ndarray:
-        """Pool axial tokens along the slice (depth) axis.
-
-        Args:
-            tokens: (N_slices, Gh, Gw, D_embed)
-            block_depth: number of slices to pool together
-
-        Returns: (D_pooled, Gh, Gw, D_embed)
-        """
-        n, gh, gw, d = tokens.shape
-        if block_depth <= 1:
-            return tokens
-
-        n_blocks = max(1, n // block_depth)
-        # Trim to evenly divisible
-        trimmed = tokens[:n_blocks * block_depth]
-        pooled = trimmed.reshape(n_blocks, block_depth, gh, gw, d).mean(axis=1)
-        return pooled
-
-    def _align_to_grid(self, tokens: np.ndarray, target_shape: tuple) -> np.ndarray:
-        """Resize token grid to match target 3D shape via interpolation.
-
-        Args:
-            tokens: (N, Gh, Gw, D_embed)
-            target_shape: (D_target, Gh_target, Gw_target)
-
-        Returns: (D_target, Gh_target, Gw_target, D_embed)
+        Returns:
+            (volume_224, tissue_mask_224, original_shape, zoom_factors)
         """
         from scipy.ndimage import zoom
 
-        d_in, gh_in, gw_in, embed = tokens.shape
-        d_t, gh_t, gw_t = target_shape
+        hu_arrays = session_data.hu_arrays
+        if not hu_arrays:
+            raise ValueError("No HU arrays in session")
 
-        if (d_in, gh_in, gw_in) == (d_t, gh_t, gw_t):
-            return tokens
+        # Stack to 3D volume
+        volume = np.stack(hu_arrays).astype(np.float32)  # (N, H, W)
+        orig_shape = volume.shape
 
-        # Zoom spatial dims, keep embed dim unchanged
-        factors = (d_t / d_in, gh_t / gh_in, gw_t / gw_in, 1.0)
-        return zoom(tokens, factors, order=1).astype(np.float32)
+        # Tissue mask (before windowing)
+        tissue_mask = volume > TISSUE_HU_THRESHOLD  # bool (N, H, W)
 
-    # ── K-NN mutual scoring ───────────────────────────────────────────────
+        # Soft-tissue window → [0, 1]
+        volume = np.clip(volume, HU_MIN, HU_MAX)
+        volume = (volume - HU_MIN) / (HU_MAX - HU_MIN)  # [0, 1]
 
-    def _knn_mutual_scoring(self, tokens: np.ndarray, D: int, H: int, W: int) -> np.ndarray:
-        """Self-referencing K-NN anomaly scoring with spatial neighbor exclusion.
+        # Resample to 224^3
+        zoom_factors = tuple(TARGET_SIZE / s for s in orig_shape)
+        volume_224 = zoom(volume, zoom_factors, order=1).astype(np.float32)
+        mask_224 = zoom(tissue_mask.astype(np.float32), zoom_factors, order=0) > 0.5
+
+        return volume_224, mask_224, orig_shape, zoom_factors
+
+    # ── Feature extraction ────────────────────────────────────────────────
+
+    def _extract_and_fuse_layer(self, volume: np.ndarray, layer_idx: int) -> np.ndarray:
+        """Extract features for one DINOv2 layer from all 3 axes and fuse.
+
+        Args:
+            volume: (224, 224, 224) float [0, 1]
+            layer_idx: which encoder layer to extract from
+
+        Returns:
+            (GRID_DIM^3, 3*PROJ_DIM) fused projected tokens
+        """
+        import torch
+
+        axes = ("axial", "coronal", "sagittal")
+        proj_matrix = self._proj_matrices[layer_idx]
+        voxel_components = []
+
+        for axis_name in axes:
+            # Collect all slices along this axis
+            slices = self._collect_axis_slices(volume, axis_name)
+
+            # Extract tokens from DINOv2 at this layer
+            tokens = self._encode_slices(slices, layer_idx)  # (N_slices, 16*16, 768) tensor
+
+            # Pool along depth, L2-normalize, permute to common grid
+            grid_tokens = self._tokens_to_voxel_grid(axis_name, tokens)  # (16, 16, 16, 768)
+
+            # Random projection
+            flat = grid_tokens.reshape(-1, EMBED_DIM)  # (4096, 768)
+            if isinstance(flat, torch.Tensor):
+                flat = flat.cpu().float().numpy()
+            proj = flat @ proj_matrix  # (4096, 128)
+            voxel_components.append(proj)
+
+        # Concatenate all axes → 384-dim
+        fused = np.concatenate(voxel_components, axis=1)  # (4096, 384)
+        return fused.astype(np.float32)
+
+    def _collect_axis_slices(self, volume: np.ndarray, axis: str) -> list:
+        """Collect ALL 2D slices along an axis from (D, H, W) volume."""
+        if axis == "axial":
+            return [volume[i, :, :] for i in range(volume.shape[0])]
+        elif axis == "coronal":
+            return [volume[:, i, :] for i in range(volume.shape[1])]
+        elif axis == "sagittal":
+            return [volume[:, :, i] for i in range(volume.shape[2])]
+        else:
+            raise ValueError(f"Unknown axis: {axis}")
+
+    def _encode_slices(self, slice_list: list, layer_idx: int):
+        """Extract DINOv2 tokens at a specific layer for a list of 2D grayscale slices.
+
+        Args:
+            slice_list: list of (H, W) float [0, 1] arrays (224x224)
+            layer_idx: encoder layer index (1-based)
+
+        Returns:
+            torch.Tensor of shape (N_slices, n_patches, embed_dim)
+        """
+        import torch
+
+        all_tokens = []
+        batch_size = 16  # 224x224 slices are small, can batch more
+
+        for i in range(0, len(slice_list), batch_size):
+            batch_slices = slice_list[i:i + batch_size]
+
+            # Convert [0,1] float → uint8 PIL for AutoImageProcessor
+            pil_imgs = [
+                PIL.Image.fromarray((s * 255).astype(np.uint8))
+                for s in batch_slices
+            ]
+
+            # AutoImageProcessor handles: grayscale→RGB, rescale, ImageNet normalize
+            inputs = self.processor(
+                images=pil_imgs,
+                return_tensors="pt",
+                do_resize=False,       # already 224x224
+                do_center_crop=False,
+                do_pad=False,
+                do_rescale=self.processor.do_rescale,
+                do_normalize=self.processor.do_normalize,
+            )
+            inputs = {k: v.cuda().half() for k, v in inputs.items()}
+
+            # Register hook on target layer
+            captured = {}
+
+            def hook_fn(module, input, output):
+                captured["state"] = output
+
+            handle = self.encoder_blocks[layer_idx - 1].register_forward_hook(hook_fn)
+
+            with torch.inference_mode(), torch.amp.autocast("cuda"):
+                self.model(**inputs)
+
+            handle.remove()
+
+            # Extract patch tokens (skip CLS)
+            hidden = captured["state"]
+            if isinstance(hidden, (tuple, list)):
+                hidden = hidden[0]
+            tokens = hidden[:, 1:, :]  # (B, n_patches, 768)
+            all_tokens.append(tokens)
+
+        return torch.cat(all_tokens, dim=0)  # (N_slices, n_patches, 768)
+
+    def _tokens_to_voxel_grid(self, axis_name: str, tokens):
+        """Pool along depth, L2-normalize, and permute to common (x,y,z) frame.
+
+        Args:
+            axis_name: "axial", "coronal", or "sagittal"
+            tokens: (N_slices, n_patches, embed_dim) tensor
+
+        Returns:
+            (GRID_DIM, GRID_DIM, GRID_DIM, embed_dim) tensor
+        """
+        import torch
+
+        # Pool along depth (groups of PATCH_SIZE=14 slices)
+        pooled = self._pool_along_depth(tokens)  # (d, n_patches, embed_dim)
+
+        # L2 normalize each token
+        pooled = pooled / (pooled.norm(dim=-1, keepdim=True) + 1e-6)
+
+        # Reshape to 3D grid: (d_depth, d_h, d_w, embed_dim)
+        d = pooled.shape[0]
+        n_patches_per_slice = pooled.shape[1]
+        side = int(np.sqrt(n_patches_per_slice))  # should be 16 for 224/14
+        grid = pooled.view(d, side, side, -1)
+
+        # Permute to common coordinate system
+        if axis_name == "axial":
+            return grid.permute(1, 2, 0, 3)   # (h, w, z, C)
+        elif axis_name == "coronal":
+            return grid.permute(1, 0, 2, 3)   # (h, z, w, C)
+        elif axis_name == "sagittal":
+            return grid                         # already (z, h, w, C) — identity
+        else:
+            raise ValueError(f"Unknown axis: {axis_name}")
+
+    @staticmethod
+    def _pool_along_depth(tokens):
+        """Average-pool tokens along the depth (slice) dimension.
+
+        Args:
+            tokens: (N_slices, n_patches, embed_dim) tensor
+
+        Returns:
+            (N_slices // PATCH_SIZE, n_patches, embed_dim) tensor
+        """
+        d, npatches, dtoken = tokens.shape
+        k = PATCH_SIZE
+        # Trim to evenly divisible
+        if d % k != 0:
+            tokens = tokens[:d - (d % k)]
+            d = tokens.shape[0]
+        return tokens.view(d // k, k, npatches, dtoken).mean(dim=1)
+
+    # ── K-NN scoring ──────────────────────────────────────────────────────
+
+    def _knn_scoring(self, tokens: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        """Self-referencing K-NN anomaly scoring with tissue masking.
 
         Args:
             tokens: (N_tokens, feat_dim) float32
-            D, H, W: spatial dimensions for neighbor exclusion
+            valid_mask: (N_tokens,) bool — True for tissue tokens
 
-        Returns: (N_tokens,) anomaly scores normalized to [0, 1]
+        Returns:
+            (N_tokens,) anomaly scores (0 for background tokens)
         """
+        n_tokens = tokens.shape[0]
+        scores = np.zeros(n_tokens, dtype=np.float32)
+
+        # Only process valid (tissue) tokens
+        valid_indices = np.where(valid_mask)[0]
+        if len(valid_indices) < K_NEIGHBORS + 10:
+            return scores
+
+        valid_tokens = np.ascontiguousarray(tokens[valid_indices], dtype=np.float32)
+        n_valid = len(valid_indices)
+
+        # Build 3D coordinates for spatial exclusion (in token grid space)
+        all_coords = np.array(
+            np.unravel_index(np.arange(n_tokens), (GRID_DIM, GRID_DIM, GRID_DIM))
+        ).T  # (N_tokens, 3)
+        valid_coords = all_coords[valid_indices]  # (n_valid, 3)
+
+        # K-NN search — try FAISS, fallback to scipy
+        k_buffer = self._count_spatial_neighbors(EXCLUDE_RADIUS)
+        k_search = min(K_NEIGHBORS + k_buffer, n_valid - 1)
+
         try:
             import faiss
+            try:
+                res = faiss.StandardGpuResources()
+                index = faiss.GpuIndexFlatL2(res, valid_tokens.shape[1])
+            except (AttributeError, RuntimeError):
+                index = faiss.IndexFlatL2(valid_tokens.shape[1])
+            index.add(valid_tokens)
+            distances, nn_indices = index.search(valid_tokens, k_search + 1)
         except ImportError:
-            logger.warning("FAISS not available, falling back to scipy KNN")
-            return self._knn_scoring_scipy(tokens, D, H, W)
+            from scipy.spatial import cKDTree
+            tree = cKDTree(valid_tokens)
+            distances, nn_indices = tree.query(valid_tokens, k=k_search + 1)
 
-        n_tokens, feat_dim = tokens.shape
-        tokens_c = np.ascontiguousarray(tokens, dtype=np.float32)
-
-        # Build FAISS index
-        k_search = min(K_NEIGHBORS + self._count_spatial_neighbors(EXCLUDE_RADIUS), n_tokens - 1)
-
-        try:
-            # Try GPU FAISS first
-            res = faiss.StandardGpuResources()
-            index = faiss.GpuIndexFlatL2(res, feat_dim)
-        except (AttributeError, RuntimeError):
-            # Fallback to CPU
-            index = faiss.IndexFlatL2(feat_dim)
-
-        index.add(tokens_c)
-        distances, indices = index.search(tokens_c, k_search + 1)  # +1 for self
-
-        # Build 3D coordinates for spatial exclusion
-        coords = np.array(np.unravel_index(np.arange(n_tokens), (D, H, W))).T  # (N, 3)
-
-        scores = np.zeros(n_tokens, dtype=np.float32)
-        for i in range(n_tokens):
-            # Filter out self and spatial neighbors
+        # Score each valid token
+        valid_scores = np.zeros(n_valid, dtype=np.float32)
+        for i in range(n_valid):
             valid_dists = []
-            for j_idx in range(1, k_search + 1):  # skip self at position 0
-                j = indices[i, j_idx]
-                if j < 0 or j >= n_tokens:
+            for j_idx in range(1, k_search + 1):  # skip self at 0
+                j = nn_indices[i, j_idx]
+                if j < 0 or j >= n_valid:
                     continue
-                # Check spatial distance
-                spatial_dist = np.max(np.abs(coords[i] - coords[j]))
-                if spatial_dist <= EXCLUDE_RADIUS:
-                    continue
-                valid_dists.append(distances[i, j_idx])
-                if len(valid_dists) >= K_NEIGHBORS:
-                    break
-
-            if valid_dists:
-                scores[i] = np.mean(valid_dists)
-
-        # Normalize to [0, 1]
-        s_min, s_max = scores.min(), scores.max()
-        if s_max > s_min:
-            scores = (scores - s_min) / (s_max - s_min)
-        else:
-            scores[:] = 0.0
-
-        return scores
-
-    def _knn_scoring_scipy(self, tokens: np.ndarray, D: int, H: int, W: int) -> np.ndarray:
-        """Fallback K-NN scoring using scipy when FAISS is not available."""
-        from scipy.spatial import cKDTree
-
-        n_tokens = tokens.shape[0]
-        tree = cKDTree(tokens)
-
-        k_search = min(K_NEIGHBORS + self._count_spatial_neighbors(EXCLUDE_RADIUS), n_tokens - 1)
-        distances, indices = tree.query(tokens, k=k_search + 1)
-
-        coords = np.array(np.unravel_index(np.arange(n_tokens), (D, H, W))).T
-
-        scores = np.zeros(n_tokens, dtype=np.float32)
-        for i in range(n_tokens):
-            valid_dists = []
-            for j_idx in range(1, k_search + 1):
-                j = indices[i, j_idx]
-                spatial_dist = np.max(np.abs(coords[i] - coords[j]))
+                # Chebyshev spatial distance exclusion
+                spatial_dist = np.max(np.abs(valid_coords[i] - valid_coords[j]))
                 if spatial_dist <= EXCLUDE_RADIUS:
                     continue
                 valid_dists.append(distances[i, j_idx])
                 if len(valid_dists) >= K_NEIGHBORS:
                     break
             if valid_dists:
-                scores[i] = np.mean(valid_dists)
+                valid_scores[i] = np.mean(valid_dists)
 
-        s_min, s_max = scores.min(), scores.max()
-        if s_max > s_min:
-            scores = (scores - s_min) / (s_max - s_min)
+        # Write back to full score array
+        scores[valid_indices] = valid_scores
         return scores
 
     @staticmethod
     def _count_spatial_neighbors(radius: int) -> int:
         """Count voxels within Chebyshev radius (for K-NN search buffer)."""
         side = 2 * radius + 1
-        return side ** 3 - 1  # exclude center
+        return side ** 3 - 1
 
     # ── Upsampling and ROI extraction ─────────────────────────────────────
 
-    def _upsample_to_volume(
-        self, score_grid: np.ndarray, n_slices: int, h: int, w: int
+    def _upsample_to_original(
+        self, score_grid: np.ndarray, orig_shape: tuple, zoom_factors: tuple
     ) -> np.ndarray:
-        """Upsample 3D anomaly score grid to original volume resolution.
+        """Upsample (16,16,16) score grid back to original volume resolution.
 
-        Args:
-            score_grid: (D, Gh, Gw) float32 anomaly scores
-            n_slices, h, w: target volume dimensions
-
-        Returns: (n_slices, h, w) float32
+        Two-step: first to (224,224,224), then to original shape.
         """
         from scipy.ndimage import zoom
 
-        d, gh, gw = score_grid.shape
-        factors = (n_slices / d, h / gh, w / gw)
-        return zoom(score_grid, factors, order=1).astype(np.float32)
+        # Step 1: 16^3 → 224^3
+        factor_to_224 = TARGET_SIZE / GRID_DIM  # = 14
+        vol_224 = zoom(score_grid, factor_to_224, order=1).astype(np.float32)
+
+        # Step 2: 224^3 → original shape
+        inv_factors = tuple(1.0 / z for z in zoom_factors)
+        return zoom(vol_224, inv_factors, order=1).astype(np.float32)
 
     def _extract_rois(self, anomaly_volume: np.ndarray) -> tuple:
         """Extract per-slice ROIs from the 3D anomaly volume.
@@ -443,9 +468,13 @@ class DINOv2CoDeGraphService:
         # Per-slice max scores
         slice_scores = [float(anomaly_volume[i].max()) for i in range(n_slices)]
 
-        # Global threshold
-        mean_score = float(np.mean(anomaly_volume))
-        std_score = float(np.std(anomaly_volume))
+        # Threshold on tissue-only scores (non-zero)
+        tissue_scores = anomaly_volume[anomaly_volume > 0]
+        if len(tissue_scores) == 0:
+            return slice_scores, {}, list(range(min(TOP_K_SLICES, n_slices)))
+
+        mean_score = float(np.mean(tissue_scores))
+        std_score = float(np.std(tissue_scores))
         threshold = mean_score + ANOMALY_THRESHOLD_SIGMA * std_score
 
         auto_rois: dict[int, dict] = {}
@@ -454,12 +483,10 @@ class DINOv2CoDeGraphService:
             slice_map = anomaly_volume[i]
             binary = slice_map > threshold
 
-            # Connected components
             labeled, n_components = label(binary)
             if n_components == 0:
                 continue
 
-            # Find largest component
             best_area = 0
             best_bbox = None
             for comp_id in range(1, n_components + 1):
@@ -470,7 +497,6 @@ class DINOv2CoDeGraphService:
                 if area > best_area:
                     best_area = area
                     ys, xs = np.where(comp_mask)
-                    # Add some padding (5% of image dims)
                     pad_y, pad_x = int(h * 0.03), int(w * 0.03)
                     y_min = max(0, ys.min() - pad_y)
                     y_max = min(h, ys.max() + pad_y)
@@ -488,7 +514,6 @@ class DINOv2CoDeGraphService:
                     "height": (y_max - y_min) / h,
                 }
 
-        # Top-K slices by anomaly score
         sorted_indices = sorted(range(n_slices), key=lambda i: slice_scores[i], reverse=True)
         top_slices = sorted_indices[:TOP_K_SLICES]
 
@@ -498,60 +523,16 @@ class DINOv2CoDeGraphService:
 
     @staticmethod
     def render_heatmap_png(slice_anomaly: np.ndarray) -> bytes:
-        """Render a 2D anomaly map as a semi-transparent heatmap PNG.
-
-        Args:
-            slice_anomaly: (H, W) float32 in [0, 1]
-
-        Returns: PNG bytes (RGBA, alpha proportional to anomaly score)
-        """
+        """Render a 2D anomaly map as a semi-transparent heatmap PNG."""
         import matplotlib.cm as cm
 
         h, w = slice_anomaly.shape
-        # Apply 'hot' colormap
-        colored = cm.hot(slice_anomaly)  # (H, W, 4) float64 in [0, 1]
+        colored = cm.hot(slice_anomaly)  # (H, W, 4) float64
         rgba = (colored * 255).astype(np.uint8)
-
-        # Set alpha proportional to anomaly score (max 0.6 opacity)
-        rgba[:, :, 3] = (slice_anomaly * 153).clip(0, 153).astype(np.uint8)  # 153/255 ≈ 0.6
+        # Alpha proportional to score (max 0.6 opacity)
+        rgba[:, :, 3] = (slice_anomaly * 153).clip(0, 153).astype(np.uint8)
 
         img = PIL.Image.fromarray(rgba, mode="RGBA")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _get_slice_thickness(session_data: Any) -> float:
-        """Extract slice thickness from session metadata."""
-        # Try from metadata
-        meta = session_data.metadata
-        if meta and "slice_thickness" in meta:
-            try:
-                return float(meta["slice_thickness"])
-            except (ValueError, TypeError):
-                pass
-
-        # Infer from slice positions if available
-        if len(session_data.slice_metadata) >= 2:
-            positions = []
-            for sm in session_data.slice_metadata:
-                if isinstance(sm, dict) and "ImagePositionPatient" in sm:
-                    pos = sm["ImagePositionPatient"]
-                    if pos and len(pos) >= 3:
-                        positions.append(float(pos[2]))
-            if len(positions) >= 2:
-                positions.sort()
-                diffs = [positions[i + 1] - positions[i] for i in range(len(positions) - 1)]
-                return abs(float(np.median(diffs)))
-
-        return 1.0  # fallback
-
-    @staticmethod
-    def _get_pixel_spacing_xy(session_data: Any) -> float:
-        """Extract in-plane pixel spacing (average of row/col) from session."""
-        if session_data.pixel_spacings:
-            row, col = session_data.pixel_spacings[0]
-            return float((row + col) / 2)
-        return 1.0  # fallback
