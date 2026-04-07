@@ -36,10 +36,11 @@ MIN_COMPONENT_AREA = 50
 ANOMALY_THRESHOLD_SIGMA = 2.0
 TOP_K_SLICES = 5
 
-# ── CT windowing ─────────────────────────────────────────────────────────
-HU_MIN = -135   # soft-tissue window low
-HU_MAX = 215    # soft-tissue window high
-TISSUE_HU_THRESHOLD = -200  # air/background threshold
+# ── CT brain window ──────────────────────────────────────────────────────
+HU_MIN = 0      # brain window low  (center=40, width=80)
+HU_MAX = 80     # brain window high (matches dicom_processor brain window)
+BRAIN_HU_LOW = 0      # brain parenchyma mask lower bound
+BRAIN_HU_HIGH = 100   # mask upper bound (excludes skull/bone >100 HU)
 
 
 class DINOv2CoDeGraphService:
@@ -196,7 +197,7 @@ class DINOv2CoDeGraphService:
         Returns:
             (volume_224, tissue_mask_224, original_shape, zoom_factors)
         """
-        from scipy.ndimage import zoom
+        from scipy.ndimage import binary_opening, zoom
 
         hu_arrays = session_data.hu_arrays
         if not hu_arrays:
@@ -206,10 +207,13 @@ class DINOv2CoDeGraphService:
         volume = np.stack(hu_arrays).astype(np.float32)  # (N, H, W)
         orig_shape = volume.shape
 
-        # Tissue mask (before windowing)
-        tissue_mask = volume > TISSUE_HU_THRESHOLD  # bool (N, H, W)
+        # Brain parenchyma mask (excludes air, fat, skull/bone)
+        # — approximates skull-stripping used by original CoDeGraph3D
+        tissue_mask = (volume > BRAIN_HU_LOW) & (volume < BRAIN_HU_HIGH)
+        tissue_mask = binary_opening(tissue_mask, iterations=1)  # remove noise
 
-        # Soft-tissue window → [0, 1]
+        # Brain window [0, 80] HU → [0, 1]
+        # Gives 4.4x more brain tissue contrast than soft-tissue window [-135, 215]
         volume = np.clip(volume, HU_MIN, HU_MAX)
         volume = (volume - HU_MIN) / (HU_MAX - HU_MIN)  # [0, 1]
 
