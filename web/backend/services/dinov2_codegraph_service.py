@@ -162,15 +162,24 @@ class DINOv2CoDeGraphService:
             scores = self._knn_scoring(fused, valid_mask)
             layer_scores.append(scores)
 
-        # Step 5: Average across layers
+        # Step 5: Average across layers + threshold-based normalization
         final_scores = np.mean(layer_scores, axis=0)  # (GRID_DIM^3,)
         final_scores[~valid_mask] = 0.0
 
-        # Normalize valid scores to [0, 1]
+        # Threshold: only scores > μ+2σ are anomalous — zeroes out normal tissue
         valid_vals = final_scores[valid_mask]
-        if valid_vals.max() > valid_vals.min():
-            normalized = (valid_vals - valid_vals.min()) / (valid_vals.max() - valid_vals.min())
-            final_scores[valid_mask] = normalized
+        mu = np.mean(valid_vals)
+        sigma = np.std(valid_vals)
+        threshold = mu + ANOMALY_THRESHOLD_SIGMA * sigma
+        score_max = valid_vals.max()
+
+        if score_max > threshold:
+            thresholded = np.clip(
+                (valid_vals - threshold) / (score_max - threshold), 0.0, 1.0
+            )
+        else:
+            thresholded = np.zeros_like(valid_vals)
+        final_scores[valid_mask] = thresholded
 
         # Step 6: Reshape to 3D grid and upsample to original resolution
         score_grid = final_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
@@ -524,14 +533,22 @@ class DINOv2CoDeGraphService:
 
     @staticmethod
     def render_heatmap_png(slice_anomaly: np.ndarray) -> bytes:
-        """Render a 2D anomaly map as a semi-transparent heatmap PNG."""
+        """Render a 2D anomaly map as a heatmap PNG — only anomalous pixels shown.
+
+        Scores are already thresholded: 0 = normal (transparent), >0 = anomalous.
+        """
         import matplotlib.cm as cm
 
         h, w = slice_anomaly.shape
         colored = cm.hot(slice_anomaly)  # (H, W, 4) float64
         rgba = (colored * 255).astype(np.uint8)
-        # Alpha proportional to score (max 0.6 opacity)
-        rgba[:, :, 3] = (slice_anomaly * 153).clip(0, 153).astype(np.uint8)
+
+        # Hard cutoff: only pixels with score > 0 are visible
+        # Alpha 100-230 for anomalous regions (high visibility)
+        visible = slice_anomaly > 0
+        alpha = np.zeros((h, w), dtype=np.uint8)
+        alpha[visible] = (slice_anomaly[visible] * 128 + 100).clip(100, 230).astype(np.uint8)
+        rgba[:, :, 3] = alpha
 
         img = PIL.Image.fromarray(rgba, mode="RGBA")
         buf = io.BytesIO()
