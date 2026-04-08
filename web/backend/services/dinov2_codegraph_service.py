@@ -4,12 +4,12 @@ Training-free anomaly detection for 3D CT volumes using:
   1. DINOv2 ViT-L/14 (HuggingFace) multi-layer feature extraction (3 axes)
   2. Patch-aligned depth pooling + L2 normalization + axis permutation
   3. Random projection (1024 → 64) per axis per layer, fused to 192-dim
-  4. Self-referencing K-NN scoring with tissue masking and spatial exclusion
+  4. Bilateral mirror scoring — contralateral L2 distance exploiting brain symmetry
   5. Multi-layer score averaging → 3D anomaly map → per-slice ROI extraction
 
 Adapted from CoDeGraph3D (arxiv 2602.15315) for single-volume use.
 The cross-volume MSM graph is not applicable to single-volume; instead we use
-self-referencing K-NN exploiting brain CT bilateral symmetry.
+bilateral mirror comparison exploiting brain CT left-right symmetry.
 """
 
 import io
@@ -30,10 +30,8 @@ TARGET_SIZE = 224                      # resample volume to 224^3
 GRID_DIM = TARGET_SIZE // PATCH_SIZE  # = 16 tokens per axis
 
 # ── Scoring parameters ───────────────────────────────────────────────────
-K_NEIGHBORS = 5
-EXCLUDE_RADIUS = 2
 MIN_COMPONENT_AREA = 50
-ANOMALY_THRESHOLD_SIGMA = 2.0
+ROI_SCORE_THRESHOLD = 0.3
 TOP_K_SLICES = 5
 
 # ── CT brain window ──────────────────────────────────────────────────────
@@ -131,7 +129,7 @@ class DINOv2CoDeGraphService:
         logger.info("Token mask: %d/%d valid tokens (%.1f%%)",
                      n_valid, valid_mask.size, n_valid / valid_mask.size * 100)
 
-        if n_valid < K_NEIGHBORS + 10:
+        if n_valid < 20:
             raise ValueError(f"Too few valid tissue tokens ({n_valid}). Volume may be empty or improperly windowed.")
 
         # Step 3: Multi-axis feature extraction (1 encoding pass per axis, all layers)
@@ -159,27 +157,24 @@ class DINOv2CoDeGraphService:
         for layer_idx in LAYER_INDICES:
             logger.info("Scoring layer %d...", layer_idx)
             fused = np.concatenate(layer_axis_projs[layer_idx], axis=1).astype(np.float32)
-            scores = self._knn_scoring(fused, valid_mask)
+            scores = self._mirror_scoring(fused, valid_mask)
             layer_scores.append(scores)
 
-        # Step 5: Average across layers + threshold-based normalization
+        # Step 5: Average across layers + percentile-based normalization
         final_scores = np.mean(layer_scores, axis=0)  # (GRID_DIM^3,)
         final_scores[~valid_mask] = 0.0
 
-        # Threshold: only scores > μ+2σ are anomalous — zeroes out normal tissue
+        # Percentile normalization: scores below 90th percentile → 0 (normal tissue)
+        # Scores above 90th → rescaled to [0, 1]
         valid_vals = final_scores[valid_mask]
-        mu = np.mean(valid_vals)
-        sigma = np.std(valid_vals)
-        threshold = mu + ANOMALY_THRESHOLD_SIGMA * sigma
-        score_max = valid_vals.max()
-
-        if score_max > threshold:
-            thresholded = np.clip(
-                (valid_vals - threshold) / (score_max - threshold), 0.0, 1.0
-            )
-        else:
-            thresholded = np.zeros_like(valid_vals)
-        final_scores[valid_mask] = thresholded
+        if valid_vals.max() > 0:
+            p90 = np.percentile(valid_vals, 90)
+            p_max = np.percentile(valid_vals, 99.5)  # robust max (ignore extreme outliers)
+            if p_max > p90:
+                normalized = np.clip((valid_vals - p90) / (p_max - p90), 0.0, 1.0)
+            else:
+                normalized = np.zeros_like(valid_vals)
+            final_scores[valid_mask] = normalized
 
         # Step 6: Reshape to 3D grid and upsample to original resolution
         score_grid = final_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
@@ -371,13 +366,18 @@ class DINOv2CoDeGraphService:
             d = tokens.shape[0]
         return tokens.view(d // k, k, npatches, dtoken).mean(dim=1)
 
-    # ── K-NN scoring ──────────────────────────────────────────────────────
+    # ── Bilateral mirror scoring ────────────────────────────────────────────
 
-    def _knn_scoring(self, tokens: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
-        """Self-referencing K-NN anomaly scoring with tissue masking.
+    def _mirror_scoring(self, tokens: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        """Bilateral mirror anomaly scoring — exploits brain L-R symmetry.
+
+        For each token at (z, y, x), computes L2 distance to its
+        contralateral mirror at (z, y, GRID_DIM-1-x).
+        Normal brain → low distance (symmetric).
+        Unilateral lesion → high distance (asymmetric).
 
         Args:
-            tokens: (N_tokens, feat_dim) float32
+            tokens: (N_tokens, feat_dim) float32 — fused projected features
             valid_mask: (N_tokens,) bool — True for tissue tokens
 
         Returns:
@@ -386,65 +386,27 @@ class DINOv2CoDeGraphService:
         n_tokens = tokens.shape[0]
         scores = np.zeros(n_tokens, dtype=np.float32)
 
-        # Only process valid (tissue) tokens
-        valid_indices = np.where(valid_mask)[0]
-        if len(valid_indices) < K_NEIGHBORS + 10:
-            return scores
-
-        valid_tokens = np.ascontiguousarray(tokens[valid_indices], dtype=np.float32)
-        n_valid = len(valid_indices)
-
-        # Build 3D coordinates for spatial exclusion (in token grid space)
-        all_coords = np.array(
+        # Build mirror index: for each flat index, find the index of its L-R mirror
+        coords = np.array(
             np.unravel_index(np.arange(n_tokens), (GRID_DIM, GRID_DIM, GRID_DIM))
-        ).T  # (N_tokens, 3)
-        valid_coords = all_coords[valid_indices]  # (n_valid, 3)
+        ).T  # (N, 3) — columns are (z, y, x)
 
-        # K-NN search — try FAISS, fallback to scipy
-        k_buffer = self._count_spatial_neighbors(EXCLUDE_RADIUS)
-        k_search = min(K_NEIGHBORS + k_buffer, n_valid - 1)
+        mirror_coords = coords.copy()
+        mirror_coords[:, 2] = GRID_DIM - 1 - mirror_coords[:, 2]  # flip X (left-right)
+        mirror_indices = np.ravel_multi_index(
+            (mirror_coords[:, 0], mirror_coords[:, 1], mirror_coords[:, 2]),
+            (GRID_DIM, GRID_DIM, GRID_DIM),
+        )
 
-        try:
-            import faiss
-            try:
-                res = faiss.StandardGpuResources()
-                index = faiss.GpuIndexFlatL2(res, valid_tokens.shape[1])
-            except (AttributeError, RuntimeError):
-                index = faiss.IndexFlatL2(valid_tokens.shape[1])
-            index.add(valid_tokens)
-            distances, nn_indices = index.search(valid_tokens, k_search + 1)
-        except ImportError:
-            from scipy.spatial import cKDTree
-            tree = cKDTree(valid_tokens)
-            distances, nn_indices = tree.query(valid_tokens, k=k_search + 1)
+        # Both token and its mirror must be valid tissue
+        both_valid = valid_mask & valid_mask[mirror_indices]
 
-        # Score each valid token
-        valid_scores = np.zeros(n_valid, dtype=np.float32)
-        for i in range(n_valid):
-            valid_dists = []
-            for j_idx in range(1, k_search + 1):  # skip self at 0
-                j = nn_indices[i, j_idx]
-                if j < 0 or j >= n_valid:
-                    continue
-                # Chebyshev spatial distance exclusion
-                spatial_dist = np.max(np.abs(valid_coords[i] - valid_coords[j]))
-                if spatial_dist <= EXCLUDE_RADIUS:
-                    continue
-                valid_dists.append(distances[i, j_idx])
-                if len(valid_dists) >= K_NEIGHBORS:
-                    break
-            if valid_dists:
-                valid_scores[i] = np.mean(valid_dists)
+        # Vectorized L2 distance to mirror
+        diffs = tokens[both_valid] - tokens[mirror_indices[both_valid]]
+        mirror_dists = np.sqrt(np.sum(diffs ** 2, axis=1))
 
-        # Write back to full score array
-        scores[valid_indices] = valid_scores
+        scores[both_valid] = mirror_dists
         return scores
-
-    @staticmethod
-    def _count_spatial_neighbors(radius: int) -> int:
-        """Count voxels within Chebyshev radius (for K-NN search buffer)."""
-        side = 2 * radius + 1
-        return side ** 3 - 1
 
     # ── Upsampling and ROI extraction ─────────────────────────────────────
 
@@ -483,9 +445,8 @@ class DINOv2CoDeGraphService:
         if len(tissue_scores) == 0:
             return slice_scores, {}, list(range(min(TOP_K_SLICES, n_slices)))
 
-        mean_score = float(np.mean(tissue_scores))
-        std_score = float(np.std(tissue_scores))
-        threshold = mean_score + ANOMALY_THRESHOLD_SIGMA * std_score
+        # Scores are already percentile-normalized [0, 1] — use fixed threshold
+        threshold = ROI_SCORE_THRESHOLD
 
         auto_rois: dict[int, dict] = {}
 
