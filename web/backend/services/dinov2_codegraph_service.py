@@ -1,16 +1,17 @@
 """DINOv2 + CoDeGraph3D anomaly detection service.
 
 Training-free anomaly detection for 3D CT volumes using:
-  1. DINOv2 ViT-L/14 (HuggingFace) multi-layer feature extraction (3 axes)
+  1. DINOv2 ViT-L/14 (HuggingFace) multi-layer feature extraction (axial only)
   2. Multi-window RGB encoding: Brain [0,80], Subdural [-20,180], Blood [20,60] HU
-  3. Patch-aligned depth pooling + L2 normalization + axis permutation
-  4. Random projection (1024 → 64) per axis per layer, fused to 192-dim
-  5. Self-referencing K-NN scoring (K=1 min-distance) with spatial exclusion
-  6. Multi-layer score averaging → 3D anomaly map → per-slice ROI extraction
+  3. Per-slice L2 normalization + random projection (1024 → 64)
+  4. Temporal-exclusion K-NN scoring (K=1): for each token on slice i,
+     K=1 nearest neighbor from slices ≥14 away — no depth pooling
+  5. sqrt(FAISS L2²) correction for proper L2 distances (matching torch.cdist)
+  6. Multi-layer score averaging → μ+2σ threshold → per-slice ROI extraction
 
 Adapted from CoDeGraph3D (arxiv 2602.15315) for single-volume use.
-Multi-window RGB encoding gives DINOv2 distinct per-channel information instead
-of grayscale repeated 3x, dramatically improving feature discriminability.
+2D per-slice approach preserves full axial resolution — no 14:1 depth pooling
+that dilutes focal lesion signals (e.g., hemorrhage spanning 5-10 slices).
 """
 
 import io
@@ -28,11 +29,11 @@ EMBED_DIM = 1024                      # DINOv2-L hidden_size
 PROJ_DIM = 64                         # random projection target dim (match original)
 LAYER_INDICES = [6, 12, 18, 24]       # 4 layers for ViT-L (24 total)
 TARGET_SIZE = 224                      # resample volume to 224^3
-GRID_DIM = TARGET_SIZE // PATCH_SIZE  # = 16 tokens per axis
+GRID_DIM = TARGET_SIZE // PATCH_SIZE  # = 16 tokens per spatial axis
 
 # ── Scoring parameters ───────────────────────────────────────────────────
-K_NEIGHBORS = 1                       # min-distance (K=1) like original CoDeGraph3D
-EXCLUDE_RADIUS = 3                    # Chebyshev exclusion radius (avoid local similarity)
+TEMPORAL_EXCLUDE = 14                 # min slice distance for temporal exclusion
+N_PATCHES = GRID_DIM * GRID_DIM      # 256 tokens per slice (16×16)
 ANOMALY_THRESHOLD_SIGMA = 2.0        # μ+Nσ threshold for normalization
 MIN_COMPONENT_AREA = 50
 TOP_K_SLICES = 5
@@ -109,6 +110,9 @@ class DINOv2CoDeGraphService:
     def detect_anomaly(self, session_data: Any) -> dict:
         """Run full anomaly detection pipeline on a session's CT volume.
 
+        2D per-slice approach: axial-only encoding, no depth pooling,
+        temporal-exclusion K-NN scoring with sqrt(L2²) correction.
+
         Args:
             session_data: SessionData with .hu_arrays, .pixel_spacings, .metadata
 
@@ -127,69 +131,67 @@ class DINOv2CoDeGraphService:
         logger.info("Volume prepared: %s → (224,224,224), tissue coverage: %.1f%%",
                      orig_shape, tissue_mask.mean() * 100)
 
-        # Step 2: Build token-level tissue mask (avg_pool — require >50% tissue coverage)
-        # avg_pool excludes edge tokens that are mostly air/bone, reducing false positives
-        mask_tensor = torch.from_numpy(tissue_mask.astype(np.float32))
-        mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
-        pooled_mask = F.avg_pool3d(mask_tensor, kernel_size=PATCH_SIZE, stride=PATCH_SIZE)
-        valid_mask = (pooled_mask.squeeze() > MASK_COVERAGE_THRESHOLD).view(-1).numpy()
-        n_valid = valid_mask.sum()
-        logger.info("Token mask: %d/%d valid tokens (%.1f%%)",
-                     n_valid, valid_mask.size, n_valid / valid_mask.size * 100)
+        # Step 2: 2D tissue mask — avg_pool2d per slice instead of avg_pool3d
+        mask_slices = torch.from_numpy(tissue_mask.astype(np.float32))  # (224, 224, 224)
+        mask_slices = mask_slices.unsqueeze(1)  # (224, 1, 224, 224) — N,C,H,W
+        pooled_mask = F.avg_pool2d(mask_slices, kernel_size=PATCH_SIZE, stride=PATCH_SIZE)
+        valid_mask_2d = (pooled_mask.squeeze(1) > MASK_COVERAGE_THRESHOLD).numpy()  # (224, 16, 16)
+
+        n_valid = valid_mask_2d.sum()
+        total_tokens = TARGET_SIZE * N_PATCHES
+        logger.info("2D token mask: %d/%d valid tokens (%.1f%%)",
+                     n_valid, total_tokens, n_valid / total_tokens * 100)
 
         if n_valid < 20:
             raise ValueError(f"Too few valid tissue tokens ({n_valid}). Volume may be empty or improperly windowed.")
 
-        # Step 3: Multi-axis feature extraction (1 encoding pass per axis, all layers)
-        layer_axis_projs: dict[int, list] = {li: [] for li in LAYER_INDICES}
+        # Step 3: Encode ALL 224 axial slices (NO depth pooling, axial only)
+        logger.info("Encoding %d axial slices (all layers)...", TARGET_SIZE)
+        axial_slices = [volume[i, :, :, :] for i in range(TARGET_SIZE)]
+        all_layer_tokens = self._encode_slices_all_layers(axial_slices)
 
-        for axis_name in ("axial", "coronal", "sagittal"):
-            logger.info("Encoding %s slices (all layers)...", axis_name)
-            slices = self._collect_axis_slices(volume, axis_name)
-            all_layer_tokens = self._encode_slices_all_layers(slices)
-
-            for layer_idx in LAYER_INDICES:
-                tokens = all_layer_tokens[layer_idx]
-                grid_tokens = self._tokens_to_voxel_grid(axis_name, tokens)
-                flat = grid_tokens.reshape(-1, EMBED_DIM)
-                if isinstance(flat, torch.Tensor):
-                    flat = flat.cpu().float().numpy()
-                proj = flat @ self._proj_matrices[layer_idx]
-                layer_axis_projs[layer_idx].append(proj)
-
-            del all_layer_tokens
-            torch.cuda.empty_cache()
-
-        # Step 4: Per-layer scoring
+        # Step 4: Per-layer: L2 norm → project → temporal-exclusion K-NN score
         layer_scores = []
         for layer_idx in LAYER_INDICES:
             logger.info("Scoring layer %d...", layer_idx)
-            fused = np.concatenate(layer_axis_projs[layer_idx], axis=1).astype(np.float32)
-            scores = self._knn_scoring(fused, valid_mask)
+            tokens = all_layer_tokens[layer_idx]  # (224, 256, 1024)
+            # L2 normalize each token
+            tokens = tokens / (tokens.norm(dim=-1, keepdim=True) + 1e-6)
+            tokens_np = tokens.cpu().float().numpy()
+            # Random projection: (224, 256, 1024) @ (1024, 64) → (224, 256, 64)
+            flat = tokens_np.reshape(-1, EMBED_DIM)
+            proj = (flat @ self._proj_matrices[layer_idx]).reshape(TARGET_SIZE, N_PATCHES, PROJ_DIM)
+            scores = self._knn_scoring_2d(proj, valid_mask_2d)
             layer_scores.append(scores)
 
-        # Step 5: Average across layers + μ+2σ threshold normalization
-        final_scores = np.mean(layer_scores, axis=0)  # (GRID_DIM^3,)
-        final_scores[~valid_mask] = 0.0
+        del all_layer_tokens
+        torch.cuda.empty_cache()
 
-        # Threshold: only scores > μ+2σ are anomalous — zeroes out normal tissue
-        valid_vals = final_scores[valid_mask]
-        mu = np.mean(valid_vals)
-        sigma = np.std(valid_vals)
+        # Step 5: Average across layers + μ+2σ threshold
+        final_scores = np.mean(layer_scores, axis=0)  # (224, 16, 16)
+        valid_mask_flat = valid_mask_2d.reshape(-1)
+        scores_flat = final_scores.reshape(-1)
+        scores_flat[~valid_mask_flat] = 0.0
+
+        valid_vals = scores_flat[valid_mask_flat]
+        mu, sigma = valid_vals.mean(), valid_vals.std()
         threshold = mu + ANOMALY_THRESHOLD_SIGMA * sigma
         score_max = valid_vals.max()
 
+        logger.info("Score stats: μ=%.4f, σ=%.4f, threshold=%.4f, max=%.4f",
+                     mu, sigma, threshold, score_max)
+
         if score_max > threshold:
-            thresholded = np.clip(
+            scores_flat[valid_mask_flat] = np.clip(
                 (valid_vals - threshold) / (score_max - threshold), 0.0, 1.0
             )
         else:
-            thresholded = np.zeros_like(valid_vals)
-        final_scores[valid_mask] = thresholded
+            scores_flat[:] = 0.0
+        scores_flat[~valid_mask_flat] = 0.0
 
-        # Step 6: Reshape to 3D grid and upsample to original resolution
-        score_grid = final_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
-        anomaly_volume = self._upsample_to_original(score_grid, orig_shape, zoom_factors)
+        # Step 6: Upsample (224, 16, 16) → original resolution
+        score_maps = scores_flat.reshape(TARGET_SIZE, GRID_DIM, GRID_DIM)
+        anomaly_volume = self._upsample_to_original(score_maps, orig_shape, zoom_factors)
 
         # Step 7: Per-slice ROI extraction
         slice_scores, auto_rois, top_slices = self._extract_rois(anomaly_volume)
@@ -253,25 +255,11 @@ class DINOv2CoDeGraphService:
 
     # ── Feature extraction ────────────────────────────────────────────────
 
-    def _collect_axis_slices(self, volume: np.ndarray, axis: str) -> list:
-        """Collect ALL 2D slices along an axis from (D, H, W, 3) RGB volume.
-
-        Returns list of (H, W, 3) RGB slices.
-        """
-        if axis == "axial":
-            return [volume[i, :, :, :] for i in range(volume.shape[0])]
-        elif axis == "coronal":
-            return [volume[:, i, :, :] for i in range(volume.shape[1])]
-        elif axis == "sagittal":
-            return [volume[:, :, i, :] for i in range(volume.shape[2])]
-        else:
-            raise ValueError(f"Unknown axis: {axis}")
-
     def _encode_slices_all_layers(self, slice_list: list) -> dict:
         """Extract DINOv2 tokens at ALL layers for a list of 2D RGB slices.
 
         Registers hooks on all layers in LAYER_INDICES simultaneously so only
-        one forward pass per batch is needed (3 passes total for 3 axes).
+        one forward pass per batch is needed.
 
         Args:
             slice_list: list of (H, W, 3) float [0, 1] RGB arrays (224x224x3)
@@ -337,150 +325,97 @@ class DINOv2CoDeGraphService:
 
         return {li: torch.cat(all_tokens[li], dim=0) for li in LAYER_INDICES}
 
-    def _tokens_to_voxel_grid(self, axis_name: str, tokens):
-        """Pool along depth, L2-normalize, and permute to common (x,y,z) frame.
+    # ── K-NN scoring (2D temporal exclusion) ──────────────────────────────
+
+    def _knn_scoring_2d(self, tokens: np.ndarray, valid_mask_2d: np.ndarray) -> np.ndarray:
+        """Per-slice anomaly scoring with temporal exclusion.
+
+        For each token on slice i, finds K=1 nearest neighbor from tokens
+        on slices at least TEMPORAL_EXCLUDE slices away. Uses sqrt on FAISS
+        squared distances for proper L2 distances (matching original CoDeGraph3D
+        which uses torch.cdist).
+
+        Chunked processing: divides slices into chunks of TEMPORAL_EXCLUDE,
+        builds one FAISS index per chunk from distant reference slices.
 
         Args:
-            axis_name: "axial", "coronal", or "sagittal"
-            tokens: (N_slices, n_patches, embed_dim) tensor
+            tokens: (224, 256, 64) float32 — projected token features
+            valid_mask_2d: (224, 16, 16) bool — tissue mask per token
 
         Returns:
-            (GRID_DIM, GRID_DIM, GRID_DIM, embed_dim) tensor
+            (224, 16, 16) float32 anomaly scores (raw L2 distances)
         """
-        import torch
+        n_slices, n_patches, feat_dim = tokens.shape
+        scores = np.zeros((n_slices, n_patches), dtype=np.float32)
+        flat_mask = valid_mask_2d.reshape(n_slices, -1)  # (224, 256)
 
-        # Pool along depth (groups of PATCH_SIZE=14 slices)
-        pooled = self._pool_along_depth(tokens)  # (d, n_patches, embed_dim)
+        for chunk_start in range(0, n_slices, TEMPORAL_EXCLUDE):
+            chunk_end = min(chunk_start + TEMPORAL_EXCLUDE, n_slices)
 
-        # L2 normalize each token
-        pooled = pooled / (pooled.norm(dim=-1, keepdim=True) + 1e-6)
+            # Reference: slices at least TEMPORAL_EXCLUDE away from ANY slice in chunk
+            excl_lo = max(0, chunk_start - TEMPORAL_EXCLUDE + 1)
+            excl_hi = min(n_slices, chunk_end + TEMPORAL_EXCLUDE - 1)
+            ref_slices = [s for s in range(n_slices) if s < excl_lo or s >= excl_hi]
 
-        # Reshape to 3D grid: (d_depth, d_h, d_w, embed_dim)
-        d = pooled.shape[0]
-        n_patches_per_slice = pooled.shape[1]
-        side = int(np.sqrt(n_patches_per_slice))  # should be 16 for 224/14
-        grid = pooled.view(d, side, side, -1)
+            if len(ref_slices) < 10:
+                logger.debug("Chunk [%d:%d] — too few reference slices (%d), skipping",
+                             chunk_start, chunk_end, len(ref_slices))
+                continue
 
-        # Permute to common (Z, Y, X, C) coordinate system.
-        # Our volume is (Z, Y, X) = (N_slices, H_rows, W_cols).
-        # Axial slices vol[i,:,:] → 2D image (Y, X) → grid (d_Z, h_Y, w_X, C) = already (Z,Y,X,C)
-        # Coronal slices vol[:,i,:] → 2D image (Z, X) → grid (d_Y, h_Z, w_X, C) → permute to (Z,Y,X,C)
-        # Sagittal slices vol[:,:,i] → 2D image (Z, Y) → grid (d_X, h_Z, w_Y, C) → permute to (Z,Y,X,C)
-        if axis_name == "axial":
-            return grid                         # (d_Z, h_Y, w_X, C) = (Z, Y, X, C)
-        elif axis_name == "coronal":
-            return grid.permute(1, 0, 2, 3)   # (d_Y, h_Z, w_X) → (Z, Y, X, C)
-        elif axis_name == "sagittal":
-            return grid.permute(1, 2, 0, 3)   # (d_X, h_Z, w_Y) → (Z, Y, X, C)
-        else:
-            raise ValueError(f"Unknown axis: {axis_name}")
+            # Collect valid reference tokens from distant slices
+            ref_token_list = []
+            for s in ref_slices:
+                mask_s = flat_mask[s]
+                if mask_s.sum() > 0:
+                    ref_token_list.append(tokens[s][mask_s])
 
-    @staticmethod
-    def _pool_along_depth(tokens):
-        """Average-pool tokens along the depth (slice) dimension.
+            if len(ref_token_list) == 0:
+                continue
 
-        Args:
-            tokens: (N_slices, n_patches, embed_dim) tensor
+            ref_tokens = np.concatenate(ref_token_list, axis=0).astype(np.float32)
+            if len(ref_tokens) < 2:
+                continue
 
-        Returns:
-            (N_slices // PATCH_SIZE, n_patches, embed_dim) tensor
-        """
-        d, npatches, dtoken = tokens.shape
-        k = PATCH_SIZE
-        # Trim to evenly divisible
-        if d % k != 0:
-            tokens = tokens[:d - (d % k)]
-            d = tokens.shape[0]
-        return tokens.view(d // k, k, npatches, dtoken).mean(dim=1)
-
-    # ── K-NN scoring ──────────────────────────────────────────────────────
-
-    def _knn_scoring(self, tokens: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
-        """Self-referencing K-NN anomaly scoring with spatial exclusion.
-
-        Uses K=1 (minimum non-local distance) matching CoDeGraph3D's original
-        approach of using minimum L2 distance for anomaly scoring.
-
-        Args:
-            tokens: (N_tokens, feat_dim) float32
-            valid_mask: (N_tokens,) bool — True for tissue tokens
-
-        Returns:
-            (N_tokens,) anomaly scores (0 for background tokens)
-        """
-        n_tokens = tokens.shape[0]
-        scores = np.zeros(n_tokens, dtype=np.float32)
-
-        valid_indices = np.where(valid_mask)[0]
-        if len(valid_indices) < K_NEIGHBORS + 10:
-            return scores
-
-        valid_tokens = np.ascontiguousarray(tokens[valid_indices], dtype=np.float32)
-        n_valid = len(valid_indices)
-
-        # 3D coordinates for spatial exclusion
-        all_coords = np.array(
-            np.unravel_index(np.arange(n_tokens), (GRID_DIM, GRID_DIM, GRID_DIM))
-        ).T  # (N_tokens, 3)
-        valid_coords = all_coords[valid_indices]  # (n_valid, 3)
-
-        # Search buffer: enough neighbors to find K non-local ones
-        k_buffer = self._count_spatial_neighbors(EXCLUDE_RADIUS)
-        k_search = min(K_NEIGHBORS + k_buffer, n_valid - 1)
-
-        try:
+            # Build FAISS index for this chunk's reference set
             import faiss
             try:
                 res = faiss.StandardGpuResources()
-                index = faiss.GpuIndexFlatL2(res, valid_tokens.shape[1])
+                index = faiss.GpuIndexFlatL2(res, feat_dim)
             except (AttributeError, RuntimeError):
-                index = faiss.IndexFlatL2(valid_tokens.shape[1])
-            index.add(valid_tokens)
-            distances, nn_indices = index.search(valid_tokens, k_search + 1)
-        except ImportError:
-            from scipy.spatial import cKDTree
-            tree = cKDTree(valid_tokens)
-            distances, nn_indices = tree.query(valid_tokens, k=k_search + 1)
+                index = faiss.IndexFlatL2(feat_dim)
+            index.add(np.ascontiguousarray(ref_tokens))
 
-        # Score each valid token — use min distance (K=1) to non-local neighbor
-        valid_scores = np.zeros(n_valid, dtype=np.float32)
-        for i in range(n_valid):
-            for j_idx in range(1, k_search + 1):  # skip self at 0
-                j = nn_indices[i, j_idx]
-                if j < 0 or j >= n_valid:
+            logger.debug("Chunk [%d:%d] — %d ref tokens from %d slices",
+                         chunk_start, chunk_end, len(ref_tokens), len(ref_slices))
+
+            # Score each query slice in this chunk
+            for s in range(chunk_start, chunk_end):
+                mask_s = flat_mask[s]
+                if mask_s.sum() == 0:
                     continue
-                spatial_dist = np.max(np.abs(valid_coords[i] - valid_coords[j]))
-                if spatial_dist <= EXCLUDE_RADIUS:
-                    continue
-                # K=1: take the FIRST (minimum) non-local distance
-                valid_scores[i] = distances[i, j_idx]
-                break
+                query = np.ascontiguousarray(tokens[s][mask_s], dtype=np.float32)
+                dists_sq, _ = index.search(query, 1)  # (N_q, 1) — L2 SQUARED
+                # CRITICAL: sqrt to get actual L2 distance (matching torch.cdist)
+                scores[s, mask_s] = np.sqrt(np.maximum(dists_sq[:, 0], 0.0))
 
-        scores[valid_indices] = valid_scores
-        return scores
-
-    @staticmethod
-    def _count_spatial_neighbors(radius: int) -> int:
-        """Count voxels within Chebyshev radius (for K-NN search buffer)."""
-        side = 2 * radius + 1
-        return side ** 3 - 1
+        return scores.reshape(n_slices, GRID_DIM, GRID_DIM)
 
     # ── Upsampling and ROI extraction ─────────────────────────────────────
 
     def _upsample_to_original(
         self, score_grid: np.ndarray, orig_shape: tuple, zoom_factors: tuple
     ) -> np.ndarray:
-        """Upsample (16,16,16) score grid back to original volume resolution.
+        """Upsample (224, 16, 16) score grid back to original volume resolution.
 
-        Two-step: first to (224,224,224), then to original shape.
+        Two-step: first spatial dims to (224, 224, 224), then to original shape.
         """
         from scipy.ndimage import zoom
 
-        # Step 1: 16^3 → 224^3
-        factor_to_224 = TARGET_SIZE / GRID_DIM  # = 14
-        vol_224 = zoom(score_grid, factor_to_224, order=1).astype(np.float32)
+        # Step 1: (224, 16, 16) → (224, 224, 224): spatial dims only
+        factors_to_224 = (1.0, TARGET_SIZE / GRID_DIM, TARGET_SIZE / GRID_DIM)
+        vol_224 = zoom(score_grid, factors_to_224, order=1).astype(np.float32)
 
-        # Step 2: 224^3 → original shape
+        # Step 2: (224, 224, 224) → original shape
         inv_factors = tuple(1.0 / z for z in zoom_factors)
         return zoom(vol_224, inv_factors, order=1).astype(np.float32)
 
