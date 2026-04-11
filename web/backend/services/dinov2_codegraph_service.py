@@ -2,15 +2,15 @@
 
 Training-free anomaly detection for 3D CT volumes using:
   1. DINOv2 ViT-L/14 (HuggingFace) multi-layer feature extraction (3 axes)
-  2. Patch-aligned depth pooling + L2 normalization + axis permutation
-  3. Random projection (1024 → 64) per axis per layer, fused to 192-dim
-  4. Self-referencing K-NN scoring (K=1 min-distance) with spatial exclusion
-  5. Multi-layer score averaging → 3D anomaly map → per-slice ROI extraction
+  2. Multi-window RGB encoding: Brain [0,80], Subdural [-20,180], Blood [20,60] HU
+  3. Patch-aligned depth pooling + L2 normalization + axis permutation
+  4. Random projection (1024 → 64) per axis per layer, fused to 192-dim
+  5. Self-referencing K-NN scoring (K=1 min-distance) with spatial exclusion
+  6. Multi-layer score averaging → 3D anomaly map → per-slice ROI extraction
 
 Adapted from CoDeGraph3D (arxiv 2602.15315) for single-volume use.
-The cross-volume MSM graph is not applicable to single-volume; instead we use
-self-referencing K=1 nearest non-local neighbor (min-distance), matching the
-original's use of minimum L2 distance for anomaly scoring.
+Multi-window RGB encoding gives DINOv2 distinct per-channel information instead
+of grayscale repeated 3x, dramatically improving feature discriminability.
 """
 
 import io
@@ -37,11 +37,15 @@ ANOMALY_THRESHOLD_SIGMA = 2.0        # μ+Nσ threshold for normalization
 MIN_COMPONENT_AREA = 50
 TOP_K_SLICES = 5
 
-# ── CT brain window ──────────────────────────────────────────────────────
-HU_MIN = 0      # brain window low  (center=40, width=80)
-HU_MAX = 80     # brain window high (matches dicom_processor brain window)
-BRAIN_HU_LOW = 0      # brain parenchyma mask lower bound
-BRAIN_HU_HIGH = 100   # mask upper bound (excludes skull/bone >100 HU)
+# ── CT multi-window RGB encoding ─────────────────────────────────────────
+# Three clinically distinct windows → R, G, B channels for DINOv2.
+# Gives per-channel information instead of grayscale repeated 3x.
+WIN_BRAIN = (0, 80)       # R: brain parenchyma (L=40, W=80)
+WIN_SUBDURAL = (-20, 180) # G: subdural/wide (L=80, W=200) — captures extra-axial
+WIN_BLOOD = (20, 60)      # B: narrow blood (L=40, W=40) — maximizes blood vs brain
+BRAIN_HU_LOW = 0          # brain parenchyma mask lower bound
+BRAIN_HU_HIGH = 100       # mask upper bound (excludes skull/bone >100 HU)
+MASK_COVERAGE_THRESHOLD = 0.5  # avg_pool threshold — require >50% tissue per token
 
 
 class DINOv2CoDeGraphService:
@@ -123,11 +127,12 @@ class DINOv2CoDeGraphService:
         logger.info("Volume prepared: %s → (224,224,224), tissue coverage: %.1f%%",
                      orig_shape, tissue_mask.mean() * 100)
 
-        # Step 2: Build token-level tissue mask
+        # Step 2: Build token-level tissue mask (avg_pool — require >50% tissue coverage)
+        # avg_pool excludes edge tokens that are mostly air/bone, reducing false positives
         mask_tensor = torch.from_numpy(tissue_mask.astype(np.float32))
         mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
-        pooled_mask = F.max_pool3d(mask_tensor, kernel_size=PATCH_SIZE, stride=PATCH_SIZE)
-        valid_mask = (pooled_mask.squeeze() > 0).view(-1).numpy()  # (GRID_DIM^3,)
+        pooled_mask = F.avg_pool3d(mask_tensor, kernel_size=PATCH_SIZE, stride=PATCH_SIZE)
+        valid_mask = (pooled_mask.squeeze() > MASK_COVERAGE_THRESHOLD).view(-1).numpy()
         n_valid = valid_mask.sum()
         logger.info("Token mask: %d/%d valid tokens (%.1f%%)",
                      n_valid, valid_mask.size, n_valid / valid_mask.size * 100)
@@ -202,10 +207,16 @@ class DINOv2CoDeGraphService:
     # ── Volume preparation ────────────────────────────────────────────────
 
     def _prepare_volume(self, session_data: Any):
-        """Convert HU arrays to windowed [0,1] volume + tissue mask, resampled to 224^3.
+        """Convert HU arrays to multi-window RGB volume + tissue mask, resampled to 224^3.
+
+        Three CT windows → R, G, B channels:
+          R: Brain [0, 80] HU — standard parenchyma contrast
+          G: Subdural [-20, 180] HU — wide range for extra-axial collections
+          B: Blood [20, 60] HU — narrow, maximizes blood vs brain contrast
 
         Returns:
-            (volume_224, tissue_mask_224, original_shape, zoom_factors)
+            (volume_rgb_224, tissue_mask_224, original_shape, zoom_factors)
+            where volume_rgb_224 is (224, 224, 224, 3) float32 in [0, 1]
         """
         from scipy.ndimage import binary_opening, zoom
 
@@ -213,48 +224,57 @@ class DINOv2CoDeGraphService:
         if not hu_arrays:
             raise ValueError("No HU arrays in session")
 
-        # Stack to 3D volume
-        volume = np.stack(hu_arrays).astype(np.float32)  # (N, H, W)
-        orig_shape = volume.shape
+        # Stack to 3D volume (raw HU)
+        hu_vol = np.stack(hu_arrays).astype(np.float32)  # (N, H, W)
+        orig_shape = hu_vol.shape
 
         # Brain parenchyma mask (excludes air, fat, skull/bone)
-        # — approximates skull-stripping used by original CoDeGraph3D
-        tissue_mask = (volume > BRAIN_HU_LOW) & (volume < BRAIN_HU_HIGH)
-        tissue_mask = binary_opening(tissue_mask, iterations=1)  # remove noise
+        tissue_mask = (hu_vol > BRAIN_HU_LOW) & (hu_vol < BRAIN_HU_HIGH)
+        tissue_mask = binary_opening(tissue_mask, iterations=1)
 
-        # Brain window [0, 80] HU → [0, 1]
-        # Gives 4.4x more brain tissue contrast than soft-tissue window [-135, 215]
-        volume = np.clip(volume, HU_MIN, HU_MAX)
-        volume = (volume - HU_MIN) / (HU_MAX - HU_MIN)  # [0, 1]
-
-        # Resample to 224^3
+        # Resample RAW HU to 224^3 (before windowing, preserves HU values)
         zoom_factors = tuple(TARGET_SIZE / s for s in orig_shape)
-        volume_224 = zoom(volume, zoom_factors, order=1).astype(np.float32)
+        hu_224 = zoom(hu_vol, zoom_factors, order=1).astype(np.float32)
         mask_224 = zoom(tissue_mask.astype(np.float32), zoom_factors, order=0) > 0.5
 
-        return volume_224, mask_224, orig_shape, zoom_factors
+        # Multi-window RGB encoding on resampled volume
+        def window_norm(vol, lo, hi):
+            return (np.clip(vol, lo, hi) - lo) / (hi - lo)
+
+        r = window_norm(hu_224, *WIN_BRAIN)     # brain [0, 80]
+        g = window_norm(hu_224, *WIN_SUBDURAL)   # subdural [-20, 180]
+        b = window_norm(hu_224, *WIN_BLOOD)      # blood [20, 60]
+        volume_rgb = np.stack([r, g, b], axis=-1)  # (224, 224, 224, 3)
+
+        logger.info("Multi-window RGB: brain[%s], subdural[%s], blood[%s]",
+                     WIN_BRAIN, WIN_SUBDURAL, WIN_BLOOD)
+
+        return volume_rgb, mask_224, orig_shape, zoom_factors
 
     # ── Feature extraction ────────────────────────────────────────────────
 
     def _collect_axis_slices(self, volume: np.ndarray, axis: str) -> list:
-        """Collect ALL 2D slices along an axis from (D, H, W) volume."""
+        """Collect ALL 2D slices along an axis from (D, H, W, 3) RGB volume.
+
+        Returns list of (H, W, 3) RGB slices.
+        """
         if axis == "axial":
-            return [volume[i, :, :] for i in range(volume.shape[0])]
+            return [volume[i, :, :, :] for i in range(volume.shape[0])]
         elif axis == "coronal":
-            return [volume[:, i, :] for i in range(volume.shape[1])]
+            return [volume[:, i, :, :] for i in range(volume.shape[1])]
         elif axis == "sagittal":
-            return [volume[:, :, i] for i in range(volume.shape[2])]
+            return [volume[:, :, i, :] for i in range(volume.shape[2])]
         else:
             raise ValueError(f"Unknown axis: {axis}")
 
     def _encode_slices_all_layers(self, slice_list: list) -> dict:
-        """Extract DINOv2 tokens at ALL layers for a list of 2D grayscale slices.
+        """Extract DINOv2 tokens at ALL layers for a list of 2D RGB slices.
 
         Registers hooks on all layers in LAYER_INDICES simultaneously so only
         one forward pass per batch is needed (3 passes total for 3 axes).
 
         Args:
-            slice_list: list of (H, W) float [0, 1] arrays (224x224)
+            slice_list: list of (H, W, 3) float [0, 1] RGB arrays (224x224x3)
 
         Returns:
             dict[layer_idx → torch.Tensor of shape (N_slices, n_patches, EMBED_DIM)]
@@ -267,9 +287,10 @@ class DINOv2CoDeGraphService:
         for i in range(0, len(slice_list), batch_size):
             batch_slices = slice_list[i:i + batch_size]
 
-            # Convert [0,1] float → uint8 PIL for AutoImageProcessor
+            # Convert [0,1] float RGB → uint8 RGB PIL images
+            # Each slice is (H, W, 3) with distinct windows per channel
             pil_imgs = [
-                PIL.Image.fromarray((s * 255).astype(np.uint8))
+                PIL.Image.fromarray((s * 255).astype(np.uint8), mode="RGB")
                 for s in batch_slices
             ]
 
