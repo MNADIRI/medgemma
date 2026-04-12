@@ -1,17 +1,18 @@
 """DINOv2 + CoDeGraph3D anomaly detection service.
 
-Faithful reimplementation of CoDeGraph3D/MuSc3D (arxiv 2602.15315) for
-single-volume brain CT anomaly detection:
+Based on CoDeGraph3D/MuSc3D (arxiv 2602.15315), adapted for single-volume
+brain CT anomaly detection:
   1. DINOv2 ViT-L/14 multi-layer feature extraction (3 axes)
   2. Multi-window RGB encoding: Brain [0,80], Subdural [-20,180], Blood [20,60] HU
   3. Depth pooling (224→16) + L2 normalization + axis permutation → 16³ grid
-  4. Random projection (1024→64) per axis per layer, concatenated → 192-dim
+  4. Random projection (1024→256) per axis per layer, concatenated → 768-dim
   5. Self-referencing MSM scoring: torch.cdist (actual L2) + Chebyshev spatial
-     exclusion (R=3) + top-10% mean aggregation (matching original)
-  6. Multi-layer averaging → μ+2σ threshold → per-slice ROI extraction
+     exclusion (R=5) + top-5% mean aggregation
+  6. Multi-layer averaging → μ+1.5σ threshold → per-slice ROI extraction
 
-Adapted from CoDeGraph3D for single-volume use with Chebyshev spatial exclusion
-instead of cross-volume comparison. CT multi-window RGB replaces MRI input.
+Adapted for single-volume CT: larger exclusion radius (R=5) compensates for
+self-referencing (vs cross-volume in original), higher projection dim (256 vs
+64) preserves subtle CT feature differences, lower threshold for sensitivity.
 """
 
 import io
@@ -26,16 +27,16 @@ logger = logging.getLogger(__name__)
 # ── DINOv2 ViT-L/14 parameters ───────────────────────────────────────────
 PATCH_SIZE = 14
 EMBED_DIM = 1024                      # DINOv2-L hidden_size
-PROJ_DIM = 64                         # random projection target dim per axis
+PROJ_DIM = 256                        # random projection target dim per axis
 LAYER_INDICES = [6, 12, 18, 24]       # 4 layers for ViT-L (24 total)
 TARGET_SIZE = 224                      # resample volume to 224^3
 GRID_DIM = TARGET_SIZE // PATCH_SIZE  # = 16 tokens per axis
 
-# ── Scoring parameters (matching original CoDeGraph3D) ───────────────────
-EXCLUDE_RADIUS = 3                    # Chebyshev spatial exclusion for self-referencing
-TOPK_RATIO = 0.1                      # top-10% aggregation (original DEFAULT_TOPK_RATIO)
-ANOMALY_THRESHOLD_SIGMA = 2.0        # μ+Nσ threshold for normalization
-MIN_COMPONENT_AREA = 50
+# ── Scoring parameters (tuned for single-volume self-referencing) ────────
+EXCLUDE_RADIUS = 5                    # Chebyshev spatial exclusion (larger for self-ref)
+TOPK_RATIO = 0.05                     # top-5% aggregation (more sensitive than original 10%)
+ANOMALY_THRESHOLD_SIGMA = 1.5         # μ+Nσ threshold (lower for CT sensitivity)
+MIN_COMPONENT_AREA = 30
 TOP_K_SLICES = 5
 
 # ── CT multi-window RGB encoding ─────────────────────────────────────────
@@ -106,10 +107,10 @@ class DINOv2CoDeGraphService:
     # ── Main pipeline ─────────────────────────────────────────────────────
 
     def detect_anomaly(self, session_data: Any) -> dict:
-        """Run full CoDeGraph3D anomaly detection on a session's CT volume.
+        """Run CoDeGraph3D-based anomaly detection on a session's CT volume.
 
-        Faithful to original: 3 axes, depth pooling, 16³ grid, 192-dim features,
-        torch.cdist distances, top-10% mean scoring, 4-layer averaging.
+        3 axes, depth pooling, 16³ grid, 768-dim features (3×256),
+        torch.cdist distances, top-5% mean scoring, 4-layer averaging.
 
         Args:
             session_data: SessionData with .hu_arrays, .pixel_spacings, .metadata
@@ -161,16 +162,24 @@ class DINOv2CoDeGraphService:
             del all_layer_tokens
             torch.cuda.empty_cache()
 
-        # Step 4: Concatenate 3 axes → 192-dim, score per layer
+        # Step 4: Concatenate 3 axes → 768-dim, score per layer
         layer_scores = []
         for layer_idx in LAYER_INDICES:
             logger.info("Scoring layer %d...", layer_idx)
             fused = np.concatenate(layer_axis_projs[layer_idx], axis=1).astype(np.float32)
-            # fused: (4096, 192) — 3 axes × 64-dim
+            # fused: (4096, 768) — 3 axes × 256-dim
             scores = self._msm_scoring(fused, valid_mask)
             layer_scores.append(scores)
 
-        # Step 5: Average across layers + μ+2σ threshold normalization
+            # Per-layer diagnostics
+            lv = scores[valid_mask]
+            if lv.max() > 0:
+                pcts = np.percentile(lv[lv > 0], [50, 90, 95, 99])
+                logger.info("  Layer %d scores: min=%.4f, p50=%.4f, p90=%.4f, "
+                            "p95=%.4f, p99=%.4f, max=%.4f",
+                            layer_idx, lv[lv > 0].min(), *pcts, lv.max())
+
+        # Step 5: Average across layers + μ+Nσ threshold normalization
         final_scores = np.mean(layer_scores, axis=0)  # (4096,)
         final_scores[~valid_mask] = 0.0
 
@@ -180,14 +189,30 @@ class DINOv2CoDeGraphService:
         threshold = mu + ANOMALY_THRESHOLD_SIGMA * sigma
         score_max = valid_vals.max()
 
-        logger.info("Score stats: μ=%.4f, σ=%.4f, threshold=%.4f, max=%.4f",
-                     mu, sigma, threshold, score_max)
+        # Detailed score distribution for diagnostics
+        pctiles = np.percentile(valid_vals, [25, 50, 75, 90, 95, 99])
+        logger.info("Score distribution (valid voxels, n=%d):", n_valid)
+        logger.info("  p25=%.4f  p50=%.4f  p75=%.4f  p90=%.4f  p95=%.4f  p99=%.4f",
+                     *pctiles)
+        logger.info("  μ=%.4f, σ=%.4f, threshold(μ+%.1fσ)=%.4f, max=%.4f",
+                     mu, sigma, ANOMALY_THRESHOLD_SIGMA, threshold, score_max)
+
+        # Locate the max-score voxel in grid coordinates
+        max_flat_idx = np.argmax(final_scores)
+        max_z, max_y, max_x = np.unravel_index(max_flat_idx, (GRID_DIM, GRID_DIM, GRID_DIM))
+        logger.info("  Max score voxel at grid (%d, %d, %d), score=%.4f",
+                     max_z, max_y, max_x, score_max)
+
+        n_above = (valid_vals > threshold).sum()
+        logger.info("  %d/%d voxels above threshold (%.1f%%)",
+                     n_above, n_valid, n_above / n_valid * 100)
 
         if score_max > threshold:
             thresholded = np.clip(
                 (valid_vals - threshold) / (score_max - threshold), 0.0, 1.0
             )
         else:
+            logger.warning("No voxels above threshold — all scores zeroed!")
             thresholded = np.zeros_like(valid_vals)
         final_scores[valid_mask] = thresholded
         final_scores[~valid_mask] = 0.0
@@ -396,15 +421,17 @@ class DINOv2CoDeGraphService:
     def _msm_scoring(self, tokens: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
         """Self-referencing MSM scoring adapted from CoDeGraph3D/MuSc3D.
 
-        Faithful to the original:
+        Based on the original:
         - torch.cdist for actual L2 distances (not FAISS L2²)
-        - top-10% mean aggregation (matching DEFAULT_TOPK_RATIO=0.1)
+        - top-k% mean aggregation
 
-        Adapted for single-volume:
-        - Chebyshev spatial exclusion (radius=3) instead of cross-volume comparison
+        Adapted for single-volume CT:
+        - Chebyshev spatial exclusion (radius=5) to prevent self-matching
+        - Per-voxel adaptive k based on each voxel's available references
+        - top-5% for sharper anomaly discrimination
 
         Args:
-            tokens: (4096, 192) float32 — fused 3-axis projected features
+            tokens: (4096, 768) float32 — fused 3-axis projected features
             valid_mask: (4096,) bool — True for brain tissue voxels
 
         Returns:
@@ -422,7 +449,7 @@ class DINOv2CoDeGraphService:
 
         valid_tokens = torch.from_numpy(tokens[valid_idx]).float().cuda()
 
-        # Pairwise L2 distances — torch.cdist matches original EXACTLY
+        # Pairwise L2 distances — torch.cdist (actual L2, not squared)
         dist_matrix = torch.cdist(valid_tokens, valid_tokens)  # (n_valid, n_valid)
 
         # Spatial exclusion: Chebyshev distance > EXCLUDE_RADIUS
@@ -437,22 +464,36 @@ class DINOv2CoDeGraphService:
         exclude = chebyshev <= EXCLUDE_RADIUS
         dist_matrix[exclude] = float('inf')
 
+        # Per-voxel available references
+        n_refs = (~exclude).sum(dim=1)  # (n_valid,)
+        min_refs = int(n_refs.min().item())
+        median_refs = int(n_refs.float().median().item())
+        logger.info("MSM scoring: %d valid, R=%d exclusion, refs min=%d median=%d",
+                     n_valid, EXCLUDE_RADIUS, min_refs, median_refs)
+
         # Sort distances per voxel (inf pushed to end)
         sorted_dists, _ = dist_matrix.sort(dim=1)
 
-        # Top-10% mean aggregation — matching original DEFAULT_TOPK_RATIO=0.1
-        n_refs = (~exclude).sum(dim=1)  # valid references per voxel
-        median_refs = int(n_refs.float().median().item())
-        k = max(int(median_refs * TOPK_RATIO), 1)
-        logger.debug("MSM scoring: %d valid voxels, %d median refs, top-k=%d",
-                      n_valid, median_refs, k)
+        # Per-voxel adaptive k: each voxel uses top-TOPK_RATIO of its own refs
+        # This prevents edge voxels (fewer refs) from getting noisy scores
+        per_voxel_k = (n_refs.float() * TOPK_RATIO).clamp(min=1).long()  # (n_valid,)
+        k_max = int(per_voxel_k.max().item())
+        logger.info("  top-k: ratio=%.2f, k range=[%d, %d]",
+                     TOPK_RATIO, int(per_voxel_k.min().item()), k_max)
 
-        top_k = sorted_dists[:, :k]
-        top_k[top_k == float('inf')] = float('nan')
+        # Gather top-k per voxel with masking for variable k
+        top_k_all = sorted_dists[:, :k_max]  # (n_valid, k_max)
+        # Create mask: position j is valid for voxel i if j < per_voxel_k[i]
+        col_idx = torch.arange(k_max, device=top_k_all.device).unsqueeze(0)
+        k_mask = col_idx < per_voxel_k.unsqueeze(1)  # (n_valid, k_max)
+        # Also mask inf values (voxels with very few refs)
+        k_mask = k_mask & (top_k_all != float('inf'))
 
-        with torch.no_grad():
-            valid_scores = torch.nanmean(top_k, dim=1)
-            valid_scores = torch.nan_to_num(valid_scores, nan=0.0)
+        # Masked mean: sum valid distances / count valid
+        top_k_all[~k_mask] = 0.0
+        sum_dists = top_k_all.sum(dim=1)
+        count_valid = k_mask.sum(dim=1).float().clamp(min=1)
+        valid_scores = sum_dists / count_valid
 
         scores[valid_idx] = valid_scores.cpu().numpy()
         return scores
@@ -493,8 +534,8 @@ class DINOv2CoDeGraphService:
         if len(tissue_scores) == 0:
             return slice_scores, {}, list(range(min(TOP_K_SLICES, n_slices)))
 
-        # Scores are already μ+2σ normalized — use fixed threshold for ROI
-        threshold = 0.3
+        # Scores are already μ+Nσ normalized — use low threshold to catch weak anomalies
+        threshold = 0.15
 
         auto_rois: dict[int, dict] = {}
 
