@@ -56,6 +56,8 @@ SIZE_SIGMOID_ALPHA = 0.5              # size weighting steepness
 SIZE_SIGMOID_GAMMA = 5                # size weighting inflection (voxels)
 MIN_ROI_GRID_VOXELS = 2              # min component size to consider
 LAMBDA_HU = 0.2                      # HU-modulation strength for adaptive tau
+HU_DISCORDANCE_EPS = 1.0             # noise floor (1 HU ≈ CT reconstruction noise)
+HU_DISCORDANCE_MAX = 3.0             # clamp to prevent extreme threshold values
 
 # -- ROI extraction ---------------------------------------------------------
 TOP_K_SLICES = 5
@@ -419,25 +421,48 @@ class DINOv2CoDeGraphService:
             logger.info("  HU deltas: [%.1f, %.1f], median=%.1f",
                          dhu_array.min(), dhu_array.max(), np.median(dhu_array))
 
+        # Locally-calibrated HU discordance
+        if dhu_array is not None:
+            # Per-voxel local variability = median |delta_hu| with its neighbors
+            voxel_deltas: dict[int, list[float]] = defaultdict(list)
+            for (i, j), dhu in zip(edges, delta_hus):
+                voxel_deltas[i].append(dhu)
+                voxel_deltas[j].append(dhu)
+
+            local_var = np.zeros(n_valid, dtype=np.float32)
+            for i in range(n_valid):
+                if voxel_deltas[i]:
+                    local_var[i] = float(np.median(voxel_deltas[i]))
+
+            # Per-edge discordance normalized by local context
+            expected = np.array(
+                [(local_var[i] + local_var[j]) / 2.0 for i, j in edges],
+                dtype=np.float32,
+            )
+            hu_discordance = np.minimum(
+                dhu_array / (expected + HU_DISCORDANCE_EPS), HU_DISCORDANCE_MAX
+            )
+
+            logger.info("  HU discordance (local): [%.2f, %.2f], median=%.2f",
+                         hu_discordance.min(), hu_discordance.max(),
+                         np.median(hu_discordance))
+        else:
+            hu_discordance = None
+
         # Stages D-E: Multi-scale consensus
         scale_scores = []
         for q in THRESHOLD_QUANTILES:
             tau_base = float(np.percentile(sims_array, q))
 
             # HU-modulated per-edge threshold
-            if dhu_array is not None:
-                dhu_max = dhu_array.max()
-                if dhu_max > 1e-3:
-                    hu_discordance = dhu_array / dhu_max
-                else:
-                    hu_discordance = np.zeros_like(dhu_array)
+            if hu_discordance is not None:
                 tau_per_edge = tau_base * (1.0 + LAMBDA_HU * hu_discordance)
             else:
                 tau_per_edge = tau_base
 
             components = self._union_find_components(n_valid, edges, sims_array, tau_per_edge)
 
-            comp_scores = self._score_components(valid_tokens, components)
+            comp_scores = self._score_components(valid_tokens, components, edges)
             scale_scores.append(comp_scores)
 
             # Diagnostics
@@ -535,6 +560,7 @@ class DINOv2CoDeGraphService:
     def _score_components(
         tokens: np.ndarray,
         components: dict[int, list[int]],
+        edges: list[tuple[int, int]] | None = None,
     ) -> np.ndarray:
         """Score voxels by their component's contrast to the background.
 
@@ -542,6 +568,7 @@ class DINOv2CoDeGraphService:
         2. Background centroid + MAD-based dispersion
         3. Non-background components: cosine distance z-score * size sigmoid
         4. Intra-component refinement: core voxels > edge voxels
+        5. Lesion cluster agglomeration: merge adjacent scored components
         """
         n = tokens.shape[0]
         scores = np.zeros(n, dtype=np.float32)
@@ -617,6 +644,46 @@ class DINOv2CoDeGraphService:
 
             for local_idx, global_idx in enumerate(comp):
                 scores[global_idx] = s_k * float(refinement[local_idx])
+
+        # Step 5: Lesion cluster agglomeration
+        if edges is not None:
+            scored_set = set(i for i in range(n) if scores[i] > 0)
+            if len(scored_set) >= 2:
+                scored_edges = [
+                    (i, j) for i, j in edges
+                    if i in scored_set and j in scored_set
+                ]
+                if scored_edges:
+                    mini_parent = {v: v for v in scored_set}
+                    mini_rank = {v: 0 for v in scored_set}
+
+                    def mini_find(x: int) -> int:
+                        while mini_parent[x] != x:
+                            mini_parent[x] = mini_parent[mini_parent[x]]
+                            x = mini_parent[x]
+                        return x
+
+                    def mini_union(a: int, b: int) -> None:
+                        ra, rb = mini_find(a), mini_find(b)
+                        if ra == rb:
+                            return
+                        if mini_rank[ra] < mini_rank[rb]:
+                            ra, rb = rb, ra
+                        mini_parent[rb] = ra
+                        if mini_rank[ra] == mini_rank[rb]:
+                            mini_rank[ra] += 1
+
+                    for i, j in scored_edges:
+                        mini_union(i, j)
+
+                    lesion_clusters: dict[int, list[int]] = defaultdict(list)
+                    for v in scored_set:
+                        lesion_clusters[mini_find(v)].append(v)
+
+                    for cluster in lesion_clusters.values():
+                        max_score = max(scores[v] for v in cluster)
+                        for v in cluster:
+                            scores[v] = max_score
 
         return scores
 
