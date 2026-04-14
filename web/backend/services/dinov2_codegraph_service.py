@@ -1,22 +1,30 @@
-"""DINOv2 + CoDeGraph3D anomaly detection service.
+"""DINOv2 + SCGAD anomaly detection service.
 
-Based on CoDeGraph3D/MuSc3D (arxiv 2602.15315), adapted for single-volume
-brain CT anomaly detection:
+Spatially-Coherent Graph Anomaly Detection (SCGAD) for single-volume
+brain CT, replacing the MSM self-referencing approach:
   1. DINOv2 ViT-L/14 multi-layer feature extraction (3 axes)
   2. Multi-window RGB encoding: Brain [0,80], Subdural [-20,180], Blood [20,60] HU
-  3. Depth pooling (224→16) + L2 normalization + axis permutation → 16³ grid
-  4. Random projection (1024→256) per axis per layer, concatenated → 768-dim
-  5. Self-referencing MSM scoring: torch.cdist (actual L2) + Chebyshev spatial
-     exclusion (R=5) + top-5% mean aggregation
-  6. Multi-layer averaging → μ+1.5σ threshold → per-slice ROI extraction
+  3. Depth pooling (224->16) + L2 normalization + axis permutation -> 16^3 grid
+  4. Random projection (1024->256) per axis per layer, concatenated -> 768-dim
+  5. Multi-layer feature AVERAGING -> L2 normalization -> single 768-dim token set
+  6. SCGAD scoring:
+     a. Build spatial coherence graph (26-connectivity + cosine similarity)
+     b. Adaptive threshold (percentile of neighbor similarities)
+     c. Union-Find connected component decomposition
+     d. Component scoring: background identification + cosine contrast + size weighting
+     e. Multi-scale consensus (3 thresholds) -> mean score
+  7. MAD-based adaptive threshold -> per-slice ROI extraction
 
-Adapted for single-volume CT: larger exclusion radius (R=5) compensates for
-self-referencing (vs cross-volume in original), higher projection dim (256 vs
-64) preserves subtle CT feature differences, lower threshold for sensitivity.
+Key advantages over MSM:
+  - O(n) scoring vs O(n^2) pairwise distances
+  - No GPU needed for scoring stage (CPU numpy only)
+  - Exploits spatial structure of lesions (contiguity + internal homogeneity)
+  - Robust to self-referencing artifacts (hemorrhage no longer matches distant tissue)
 """
 
 import io
 import logging
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -24,7 +32,7 @@ import PIL.Image
 
 logger = logging.getLogger(__name__)
 
-# ── DINOv2 ViT-L/14 parameters ───────────────────────────────────────────
+# -- DINOv2 ViT-L/14 parameters (unchanged) --------------------------------
 PATCH_SIZE = 14
 EMBED_DIM = 1024                      # DINOv2-L hidden_size
 PROJ_DIM = 256                        # random projection target dim per axis
@@ -32,31 +40,46 @@ LAYER_INDICES = [6, 12, 18, 24]       # 4 layers for ViT-L (24 total)
 TARGET_SIZE = 224                      # resample volume to 224^3
 GRID_DIM = TARGET_SIZE // PATCH_SIZE  # = 16 tokens per axis
 
-# ── Scoring parameters (tuned for single-volume self-referencing) ────────
-EXCLUDE_RADIUS = 5                    # Chebyshev spatial exclusion (larger for self-ref)
-TOPK_RATIO = 0.05                     # top-5% aggregation (more sensitive than original 10%)
-ANOMALY_THRESHOLD_SIGMA = 1.5         # μ+Nσ threshold (lower for CT sensitivity)
-MIN_COMPONENT_AREA = 30
-TOP_K_SLICES = 5
-
-# ── CT multi-window RGB encoding ─────────────────────────────────────────
+# -- CT multi-window RGB encoding (unchanged) -------------------------------
 WIN_BRAIN = (0, 80)       # R: brain parenchyma (L=40, W=80)
 WIN_SUBDURAL = (-20, 180) # G: subdural/wide (L=80, W=200)
 WIN_BLOOD = (20, 60)      # B: narrow blood (L=40, W=40)
-BRAIN_HU_LOW = 0
-BRAIN_HU_HIGH = 100
-MASK_COVERAGE_THRESHOLD = 0.5
+
+# -- Tissue mask - wider range than previous [0, 100] ----------------------
+TISSUE_HU_LOW = -20       # includes CSF (0-15 HU)
+TISSUE_HU_HIGH = 200      # includes calcifications, excludes compact bone
+
+# -- SCGAD scoring parameters ----------------------------------------------
+THRESHOLD_QUANTILES = (15, 25, 35)    # multi-scale consensus (3 passes)
+BG_COVERAGE = 0.5                     # background = largest components >= 50%
+SIZE_SIGMOID_ALPHA = 0.5              # size weighting steepness
+SIZE_SIGMOID_GAMMA = 5                # size weighting inflection (voxels)
+MIN_ROI_GRID_VOXELS = 2              # min component size to consider
+
+# -- ROI extraction ---------------------------------------------------------
+TOP_K_SLICES = 5
+MIN_ROI_AREA_2D = 20                 # min 2D ROI area in pixels
+ROI_2D_THRESHOLD = 0.10              # low threshold since scores are MAD-normalized
+
+# -- 26-connectivity neighbor offsets (precomputed, 13 unique directions) ---
+_NEIGHBOR_OFFSETS = [
+    (dz, dy, dx)
+    for dz in (-1, 0, 1)
+    for dy in (-1, 0, 1)
+    for dx in (-1, 0, 1)
+    if (dz, dy, dx) > (0, 0, 0)
+]
 
 
 class DINOv2CoDeGraphService:
-    """Lazy-loaded DINOv2 + self-referencing anomaly detector for CT volumes."""
+    """Lazy-loaded DINOv2 + SCGAD anomaly detector for CT volumes."""
 
     def __init__(self) -> None:
         self.model = None
         self.processor = None
         self.encoder_blocks = None
         self._device = None
-        self._proj_matrices: dict[int, np.ndarray] = {}  # layer_idx → (1024, 64)
+        self._proj_matrices: dict[int, np.ndarray] = {}
 
     @property
     def is_loaded(self) -> bool:
@@ -71,11 +94,11 @@ class DINOv2CoDeGraphService:
             import torch
             from transformers import AutoImageProcessor, AutoModel
         except ImportError:
-            logger.error("PyTorch or transformers not available — DINOv2 disabled")
+            logger.error("PyTorch or transformers not available -- DINOv2 disabled")
             return
 
         if not torch.cuda.is_available():
-            logger.warning("DINOv2 requires CUDA — anomaly detection disabled")
+            logger.warning("DINOv2 requires CUDA -- anomaly detection disabled")
             return
 
         try:
@@ -95,8 +118,7 @@ class DINOv2CoDeGraphService:
             self.model = None
             return
 
-        # Initialize random projection matrices — one per layer
-        # Matches original: column-normalized Gaussian × 1/√proj_dim
+        # Initialize random projection matrices -- one per layer
         for layer_idx in LAYER_INDICES:
             rng = np.random.RandomState(42 + layer_idx)
             mat = rng.randn(EMBED_DIM, PROJ_DIM).astype(np.float32)
@@ -104,13 +126,10 @@ class DINOv2CoDeGraphService:
             mat *= 1.0 / np.sqrt(PROJ_DIM)
             self._proj_matrices[layer_idx] = mat
 
-    # ── Main pipeline ─────────────────────────────────────────────────────
+    # -- Main pipeline ------------------------------------------------------
 
     def detect_anomaly(self, session_data: Any) -> dict:
-        """Run CoDeGraph3D-based anomaly detection on a session's CT volume.
-
-        3 axes, depth pooling, 16³ grid, 768-dim features (3×256),
-        torch.cdist distances, top-5% mean scoring, 4-layer averaging.
+        """Run SCGAD anomaly detection on a session's CT volume.
 
         Args:
             session_data: SessionData with .hu_arrays, .pixel_spacings, .metadata
@@ -125,16 +144,16 @@ class DINOv2CoDeGraphService:
         if not self.is_loaded:
             raise RuntimeError("DINOv2 model not available")
 
-        # Step 1: Prepare volume — multi-window RGB + tissue mask → 224³
+        # Stage A: Prepare volume
         volume, tissue_mask, orig_shape, zoom_factors = self._prepare_volume(session_data)
-        logger.info("Volume prepared: %s → (224,224,224), tissue coverage: %.1f%%",
+        logger.info("Volume prepared: %s -> (224,224,224), tissue coverage: %.1f%%",
                      orig_shape, tissue_mask.mean() * 100)
 
-        # Step 2: 3D tissue mask — F.max_pool3d > 0 (matching original)
+        # Grid mask via max pooling
         mask_tensor = torch.from_numpy(tissue_mask.astype(np.float32))
-        mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
+        mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
         pooled_mask = F.max_pool3d(mask_tensor, kernel_size=PATCH_SIZE, stride=PATCH_SIZE)
-        valid_mask = (pooled_mask.squeeze() > 0).view(-1).numpy()  # (4096,)
+        valid_mask = (pooled_mask.squeeze() > 0).view(-1).numpy()
         n_valid = valid_mask.sum()
         logger.info("3D token mask: %d/%d valid voxels (%.1f%%)",
                      n_valid, GRID_DIM ** 3, n_valid / GRID_DIM ** 3 * 100)
@@ -142,8 +161,8 @@ class DINOv2CoDeGraphService:
         if n_valid < 20:
             raise ValueError(f"Too few valid tissue voxels ({n_valid}).")
 
-        # Step 3: Multi-axis feature extraction (3 axes × all layers)
-        layer_axis_projs: dict[int, list] = {li: [] for li in LAYER_INDICES}
+        # Stage B: Multi-axis DINOv2 feature extraction
+        layer_fused: dict[int, list] = {li: [] for li in LAYER_INDICES}
 
         for axis_name in ("axial", "coronal", "sagittal"):
             logger.info("Encoding %s slices (all layers)...", axis_name)
@@ -156,75 +175,39 @@ class DINOv2CoDeGraphService:
                 flat = grid_tokens.reshape(-1, EMBED_DIM)
                 if isinstance(flat, torch.Tensor):
                     flat = flat.cpu().float().numpy()
-                proj = flat @ self._proj_matrices[layer_idx]  # (4096, 64)
-                layer_axis_projs[layer_idx].append(proj)
+                proj = flat @ self._proj_matrices[layer_idx]
+                layer_fused[layer_idx].append(proj)
 
             del all_layer_tokens
             torch.cuda.empty_cache()
 
-        # Step 4: Concatenate 3 axes → 768-dim, score per layer
-        layer_scores = []
+        # Fuse axes per layer, then average across layers
+        layer_tokens_768 = []
         for layer_idx in LAYER_INDICES:
-            logger.info("Scoring layer %d...", layer_idx)
-            fused = np.concatenate(layer_axis_projs[layer_idx], axis=1).astype(np.float32)
-            # fused: (4096, 768) — 3 axes × 256-dim
-            scores = self._msm_scoring(fused, valid_mask)
-            layer_scores.append(scores)
+            fused = np.concatenate(layer_fused[layer_idx], axis=1).astype(np.float32)
+            layer_tokens_768.append(fused)
 
-            # Per-layer diagnostics
-            lv = scores[valid_mask]
-            if lv.max() > 0:
-                pcts = np.percentile(lv[lv > 0], [50, 90, 95, 99])
-                logger.info("  Layer %d scores: min=%.4f, p50=%.4f, p90=%.4f, "
-                            "p95=%.4f, p99=%.4f, max=%.4f",
-                            layer_idx, lv[lv > 0].min(), *pcts, lv.max())
+        avg_tokens = np.mean(layer_tokens_768, axis=0)  # (4096, 768)
+        del layer_fused, layer_tokens_768
 
-        # Step 5: Average across layers + μ+Nσ threshold normalization
-        final_scores = np.mean(layer_scores, axis=0)  # (4096,)
-        final_scores[~valid_mask] = 0.0
+        # L2 normalize -- critical for cosine similarity in graph
+        norms = np.linalg.norm(avg_tokens, axis=1, keepdims=True)
+        avg_tokens = avg_tokens / (norms + 1e-6)
 
-        valid_vals = final_scores[valid_mask]
-        mu = np.mean(valid_vals)
-        sigma = np.std(valid_vals)
-        threshold = mu + ANOMALY_THRESHOLD_SIGMA * sigma
-        score_max = valid_vals.max()
+        logger.info("Feature extraction complete: tokens %s, norm range [%.3f, %.3f]",
+                     avg_tokens.shape, norms[valid_mask].min(), norms[valid_mask].max())
 
-        # Detailed score distribution for diagnostics
-        pctiles = np.percentile(valid_vals, [25, 50, 75, 90, 95, 99])
-        logger.info("Score distribution (valid voxels, n=%d):", n_valid)
-        logger.info("  p25=%.4f  p50=%.4f  p75=%.4f  p90=%.4f  p95=%.4f  p99=%.4f",
-                     *pctiles)
-        logger.info("  μ=%.4f, σ=%.4f, threshold(μ+%.1fσ)=%.4f, max=%.4f",
-                     mu, sigma, ANOMALY_THRESHOLD_SIGMA, threshold, score_max)
+        # Stages C-E: SCGAD scoring
+        raw_scores = self._scgad_scoring(avg_tokens, valid_mask)
 
-        # Locate the max-score voxel in grid coordinates
-        max_flat_idx = np.argmax(final_scores)
-        max_z, max_y, max_x = np.unravel_index(max_flat_idx, (GRID_DIM, GRID_DIM, GRID_DIM))
-        logger.info("  Max score voxel at grid (%d, %d, %d), score=%.4f",
-                     max_z, max_y, max_x, score_max)
-
-        n_above = (valid_vals > threshold).sum()
-        logger.info("  %d/%d voxels above threshold (%.1f%%)",
-                     n_above, n_valid, n_above / n_valid * 100)
-
-        if score_max > threshold:
-            thresholded = np.clip(
-                (valid_vals - threshold) / (score_max - threshold), 0.0, 1.0
-            )
-        else:
-            logger.warning("No voxels above threshold — all scores zeroed!")
-            thresholded = np.zeros_like(valid_vals)
-        final_scores[valid_mask] = thresholded
-        final_scores[~valid_mask] = 0.0
-
-        # Step 6: Reshape to 16³ grid and upsample to original resolution
-        score_grid = final_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
+        # Stage F: Reshape, upsample, threshold, extract ROIs
+        score_grid = raw_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
         anomaly_volume = self._upsample_to_original(score_grid, orig_shape, zoom_factors)
+        anomaly_volume = self._threshold_and_normalize(anomaly_volume)
 
-        # Step 7: Per-slice ROI extraction
         slice_scores, auto_rois, top_slices = self._extract_rois(anomaly_volume)
 
-        logger.info("Anomaly detection complete: %d auto-ROIs, top slices: %s",
+        logger.info("SCGAD complete: %d auto-ROIs, top slices: %s",
                      len(auto_rois), top_slices)
 
         return {
@@ -234,19 +217,12 @@ class DINOv2CoDeGraphService:
             "top_slices": top_slices,
         }
 
-    # ── Volume preparation ────────────────────────────────────────────────
+    # -- Volume preparation -------------------------------------------------
 
     def _prepare_volume(self, session_data: Any):
-        """Convert HU arrays to multi-window RGB volume + tissue mask, resampled to 224^3.
+        """Convert HU arrays to multi-window RGB volume + tissue mask at 224^3.
 
-        Three CT windows → R, G, B channels:
-          R: Brain [0, 80] HU — standard parenchyma contrast
-          G: Subdural [-20, 180] HU — wide range for extra-axial collections
-          B: Blood [20, 60] HU — narrow, maximizes blood vs brain contrast
-
-        Returns:
-            (volume_rgb_224, tissue_mask_224, original_shape, zoom_factors)
-            where volume_rgb_224 is (224, 224, 224, 3) float32 in [0, 1]
+        Tissue mask: [-20, 200] HU (wider than original [0, 100]).
         """
         from scipy.ndimage import binary_opening, zoom
 
@@ -254,33 +230,30 @@ class DINOv2CoDeGraphService:
         if not hu_arrays:
             raise ValueError("No HU arrays in session")
 
-        hu_vol = np.stack(hu_arrays).astype(np.float32)  # (N, H, W)
+        hu_vol = np.stack(hu_arrays).astype(np.float32)
         orig_shape = hu_vol.shape
 
-        # Brain parenchyma mask (CT-specific, excludes air/fat/skull)
-        tissue_mask = (hu_vol > BRAIN_HU_LOW) & (hu_vol < BRAIN_HU_HIGH)
+        tissue_mask = (hu_vol > TISSUE_HU_LOW) & (hu_vol < TISSUE_HU_HIGH)
         tissue_mask = binary_opening(tissue_mask, iterations=1)
 
-        # Resample RAW HU to 224^3 (before windowing)
         zoom_factors = tuple(TARGET_SIZE / s for s in orig_shape)
         hu_224 = zoom(hu_vol, zoom_factors, order=1).astype(np.float32)
         mask_224 = zoom(tissue_mask.astype(np.float32), zoom_factors, order=0) > 0.5
 
-        # Multi-window RGB encoding
         def window_norm(vol, lo, hi):
             return (np.clip(vol, lo, hi) - lo) / (hi - lo)
 
         r = window_norm(hu_224, *WIN_BRAIN)
         g = window_norm(hu_224, *WIN_SUBDURAL)
         b = window_norm(hu_224, *WIN_BLOOD)
-        volume_rgb = np.stack([r, g, b], axis=-1)  # (224, 224, 224, 3)
+        volume_rgb = np.stack([r, g, b], axis=-1)
 
-        logger.info("Multi-window RGB: brain[%s], subdural[%s], blood[%s]",
-                     WIN_BRAIN, WIN_SUBDURAL, WIN_BLOOD)
+        logger.info("Multi-window RGB: brain%s, subdural%s, blood%s, mask HU[%d,%d]",
+                     WIN_BRAIN, WIN_SUBDURAL, WIN_BLOOD, TISSUE_HU_LOW, TISSUE_HU_HIGH)
 
         return volume_rgb, mask_224, orig_shape, zoom_factors
 
-    # ── Feature extraction ────────────────────────────────────────────────
+    # -- Feature extraction (unchanged) -------------------------------------
 
     def _collect_axis_slices(self, volume: np.ndarray, axis: str) -> list:
         """Collect ALL 2D slices along an axis from (Z, Y, X, 3) RGB volume."""
@@ -294,17 +267,7 @@ class DINOv2CoDeGraphService:
             raise ValueError(f"Unknown axis: {axis}")
 
     def _encode_slices_all_layers(self, slice_list: list) -> dict:
-        """Extract DINOv2 tokens at ALL layers for a list of 2D RGB slices.
-
-        Registers hooks on all layers in LAYER_INDICES simultaneously so only
-        one forward pass per batch is needed (3 passes total for 3 axes).
-
-        Args:
-            slice_list: list of (H, W, 3) float [0, 1] RGB arrays (224x224x3)
-
-        Returns:
-            dict[layer_idx → torch.Tensor of shape (N_slices, n_patches, EMBED_DIM)]
-        """
+        """Extract DINOv2 tokens at ALL layers for a list of 2D RGB slices."""
         import torch
 
         all_tokens: dict[int, list] = {li: [] for li in LAYER_INDICES}
@@ -353,41 +316,22 @@ class DINOv2CoDeGraphService:
                 hidden = captured[layer_idx]
                 if isinstance(hidden, (tuple, list)):
                     hidden = hidden[0]
-                tokens = hidden[:, 1:, :]  # (B, n_patches, EMBED_DIM)
+                tokens = hidden[:, 1:, :]
                 all_tokens[layer_idx].append(tokens)
 
         return {li: torch.cat(all_tokens[li], dim=0) for li in LAYER_INDICES}
 
     def _tokens_to_voxel_grid(self, axis_name: str, tokens):
-        """Pool along depth, L2-normalize, and permute to common (Z, Y, X) frame.
-
-        Matches original CoDeGraph3D _tokens_to_voxel_grid exactly, adapted
-        for our volume convention (Z, Y, X) instead of original (X, Y, Z).
-
-        Args:
-            axis_name: "axial", "coronal", or "sagittal"
-            tokens: (N_slices, n_patches, embed_dim) tensor
-
-        Returns:
-            (GRID_DIM, GRID_DIM, GRID_DIM, embed_dim) tensor
-        """
+        """Pool along depth, L2-normalize, permute to common (Z, Y, X) frame."""
         import torch
 
-        pooled = self._pool_along_depth(tokens)  # (16, 256, 1024)
-
-        # L2 normalize — matching original: pooled / (norm + eps) with eps=1e-6
+        pooled = self._pool_along_depth(tokens)
         pooled = pooled / (pooled.norm(dim=-1, keepdim=True) + 1e-6)
 
-        # Reshape to 3D grid
         d = pooled.shape[0]
-        side = int(np.sqrt(pooled.shape[1]))  # 16
-        grid = pooled.view(d, side, side, -1)  # (16, 16, 16, 1024)
+        side = int(np.sqrt(pooled.shape[1]))
+        grid = pooled.view(d, side, side, -1)
 
-        # Permute to common (Z, Y, X) frame.
-        # Our volume = (Z, Y, X). Slices extracted along:
-        #   axial→Z:    grid=(d_Z, h_Y, w_X) → identity
-        #   coronal→Y:  grid=(d_Y, h_Z, w_X) → permute(1, 0, 2, 3) → (Z, Y, X)
-        #   sagittal→X: grid=(d_X, h_Z, w_Y) → permute(1, 2, 0, 3) → (Z, Y, X)
         if axis_name == "axial":
             return grid
         elif axis_name == "coronal":
@@ -399,16 +343,7 @@ class DINOv2CoDeGraphService:
 
     @staticmethod
     def _pool_along_depth(tokens):
-        """Average-pool tokens along the depth (slice) dimension.
-
-        Matches original: tokens.view(d//k, k, P, D).mean(dim=1)
-
-        Args:
-            tokens: (N_slices, n_patches, embed_dim) tensor
-
-        Returns:
-            (N_slices // PATCH_SIZE, n_patches, embed_dim) tensor
-        """
+        """Average-pool tokens along the depth (slice) dimension."""
         d, npatches, dtoken = tokens.shape
         k = PATCH_SIZE
         if d % k != 0:
@@ -416,132 +351,295 @@ class DINOv2CoDeGraphService:
             d = tokens.shape[0]
         return tokens.view(d // k, k, npatches, dtoken).mean(dim=1)
 
-    # ── MSM scoring (faithful to original CoDeGraph3D) ────────────────────
+    # -- SCGAD scoring (replaces _msm_scoring) ------------------------------
 
-    def _msm_scoring(self, tokens: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
-        """Self-referencing MSM scoring adapted from CoDeGraph3D/MuSc3D.
+    def _scgad_scoring(self, tokens: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        """Spatially-Coherent Graph Anomaly Detection scoring.
 
-        Based on the original:
-        - torch.cdist for actual L2 distances (not FAISS L2²)
-        - top-k% mean aggregation
-
-        Adapted for single-volume CT:
-        - Chebyshev spatial exclusion (radius=5) to prevent self-matching
-        - Per-voxel adaptive k based on each voxel's available references
-        - top-5% for sharper anomaly discrimination
+        Stages C-E of the SCGAD pipeline:
+        1. Build 26-connectivity graph with cosine similarity edges
+        2. Multi-scale: for each threshold quantile, decompose + score
+        3. Average scores across scales for consensus
 
         Args:
-            tokens: (4096, 768) float32 — fused 3-axis projected features
-            valid_mask: (4096,) bool — True for brain tissue voxels
+            tokens: (4096, 768) float32 L2-normalized
+            valid_mask: (4096,) bool
 
         Returns:
-            (4096,) anomaly scores (0 for background voxels)
+            (4096,) float32 anomaly scores (0 for invalid voxels)
         """
-        import torch
-
-        n_tokens = tokens.shape[0]
-        scores = np.zeros(n_tokens, dtype=np.float32)
+        n_total = tokens.shape[0]
+        scores = np.zeros(n_total, dtype=np.float32)
 
         valid_idx = np.where(valid_mask)[0]
         n_valid = len(valid_idx)
         if n_valid < 20:
             return scores
 
-        valid_tokens = torch.from_numpy(tokens[valid_idx]).float().cuda()
-
-        # Pairwise L2 distances — torch.cdist (actual L2, not squared)
-        dist_matrix = torch.cdist(valid_tokens, valid_tokens)  # (n_valid, n_valid)
-
-        # Spatial exclusion: Chebyshev distance > EXCLUDE_RADIUS
+        valid_tokens = tokens[valid_idx].astype(np.float32)
         coords = np.array(
             np.unravel_index(valid_idx, (GRID_DIM, GRID_DIM, GRID_DIM))
-        ).T  # (n_valid, 3)
-        coords_t = torch.from_numpy(coords).float().cuda()
-        diff = coords_t.unsqueeze(0) - coords_t.unsqueeze(1)  # (n, n, 3)
-        chebyshev = diff.abs().max(dim=-1).values  # (n, n)
+        ).T
 
-        # Exclude self + spatially close voxels (Chebyshev ≤ R)
-        exclude = chebyshev <= EXCLUDE_RADIUS
-        dist_matrix[exclude] = float('inf')
+        # Stage C: Build spatial adjacency + compute similarities
+        edges, sims = self._compute_neighbor_similarities(valid_tokens, coords)
+        n_edges = len(sims)
 
-        # Per-voxel available references
-        n_refs = (~exclude).sum(dim=1)  # (n_valid,)
-        min_refs = int(n_refs.min().item())
-        median_refs = int(n_refs.float().median().item())
-        logger.info("MSM scoring: %d valid, R=%d exclusion, refs min=%d median=%d",
-                     n_valid, EXCLUDE_RADIUS, min_refs, median_refs)
+        if n_edges == 0:
+            logger.warning("No valid neighbor pairs -- skipping SCGAD")
+            return scores
 
-        # Sort distances per voxel (inf pushed to end)
-        sorted_dists, _ = dist_matrix.sort(dim=1)
+        sims_array = np.array(sims, dtype=np.float32)
 
-        # Per-voxel adaptive k: each voxel uses top-TOPK_RATIO of its own refs
-        # This prevents edge voxels (fewer refs) from getting noisy scores
-        per_voxel_k = (n_refs.float() * TOPK_RATIO).clamp(min=1).long()  # (n_valid,)
-        k_max = int(per_voxel_k.max().item())
-        logger.info("  top-k: ratio=%.2f, k range=[%d, %d]",
-                     TOPK_RATIO, int(per_voxel_k.min().item()), k_max)
+        logger.info("SCGAD graph: %d nodes, %d edges, sim [%.3f, %.3f], median=%.3f",
+                     n_valid, n_edges,
+                     sims_array.min(), sims_array.max(), np.median(sims_array))
 
-        # Gather top-k per voxel with masking for variable k
-        top_k_all = sorted_dists[:, :k_max]  # (n_valid, k_max)
-        # Create mask: position j is valid for voxel i if j < per_voxel_k[i]
-        col_idx = torch.arange(k_max, device=top_k_all.device).unsqueeze(0)
-        k_mask = col_idx < per_voxel_k.unsqueeze(1)  # (n_valid, k_max)
-        # Also mask inf values (voxels with very few refs)
-        k_mask = k_mask & (top_k_all != float('inf'))
+        # Stages D-E: Multi-scale consensus
+        scale_scores = []
+        for q in THRESHOLD_QUANTILES:
+            tau = float(np.percentile(sims_array, q))
+            components = self._union_find_components(n_valid, edges, sims_array, tau)
 
-        # Masked mean: sum valid distances / count valid
-        top_k_all[~k_mask] = 0.0
-        sum_dists = top_k_all.sum(dim=1)
-        count_valid = k_mask.sum(dim=1).float().clamp(min=1)
-        valid_scores = sum_dists / count_valid
+            comp_scores = self._score_components(valid_tokens, components)
+            scale_scores.append(comp_scores)
 
-        scores[valid_idx] = valid_scores.cpu().numpy()
+            # Diagnostics
+            sizes = sorted([len(c) for c in components.values()], reverse=True)
+            n_scored = int((comp_scores > 0).sum())
+            max_s = float(comp_scores.max())
+            logger.info("  P%d: tau=%.4f, %d comps (top sizes: %s), %d scored, max=%.4f",
+                         q, tau, len(components), sizes[:5], n_scored, max_s)
+
+        avg_scores = np.mean(scale_scores, axis=0)
+        scores[valid_idx] = avg_scores
         return scores
 
-    # ── Upsampling and ROI extraction ─────────────────────────────────────
+    @staticmethod
+    def _compute_neighbor_similarities(
+        tokens: np.ndarray,
+        coords: np.ndarray,
+    ) -> tuple[list[tuple[int, int]], list[float]]:
+        """Build 26-connectivity adjacency and compute cosine similarities.
+
+        Uses spatial hash for O(1) neighbor lookup. Cosine sim = dot product
+        since tokens are L2-normalized.
+        """
+        n = len(tokens)
+
+        spatial_hash: dict[tuple[int, int, int], int] = {}
+        for i in range(n):
+            spatial_hash[(int(coords[i, 0]), int(coords[i, 1]), int(coords[i, 2]))] = i
+
+        edges: list[tuple[int, int]] = []
+        similarities: list[float] = []
+
+        for i in range(n):
+            z, y, x = int(coords[i, 0]), int(coords[i, 1]), int(coords[i, 2])
+            for dz, dy, dx in _NEIGHBOR_OFFSETS:
+                j = spatial_hash.get((z + dz, y + dy, x + dx))
+                if j is not None:
+                    sim = float(tokens[i] @ tokens[j])
+                    edges.append((i, j))
+                    similarities.append(sim)
+
+        return edges, similarities
+
+    @staticmethod
+    def _union_find_components(
+        n: int,
+        edges: list[tuple[int, int]],
+        sims: np.ndarray,
+        tau: float,
+    ) -> dict[int, list[int]]:
+        """Union-Find with path halving. Connect edges where sim >= tau."""
+        parent = list(range(n))
+        rank = [0] * n
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return
+            if rank[ra] < rank[rb]:
+                ra, rb = rb, ra
+            parent[rb] = ra
+            if rank[ra] == rank[rb]:
+                rank[ra] += 1
+
+        for idx in range(len(edges)):
+            if sims[idx] >= tau:
+                union(edges[idx][0], edges[idx][1])
+
+        components: dict[int, list[int]] = defaultdict(list)
+        for i in range(n):
+            components[find(i)].append(i)
+
+        return dict(components)
+
+    @staticmethod
+    def _score_components(
+        tokens: np.ndarray,
+        components: dict[int, list[int]],
+    ) -> np.ndarray:
+        """Score voxels by their component's contrast to the background.
+
+        1. Background = largest components covering >= BG_COVERAGE
+        2. Background centroid + MAD-based dispersion
+        3. Non-background components: cosine distance z-score * size sigmoid
+        4. Intra-component refinement: core voxels > edge voxels
+        """
+        n = tokens.shape[0]
+        scores = np.zeros(n, dtype=np.float32)
+
+        if not components:
+            return scores
+
+        # Step 1: Background identification
+        comp_list = sorted(components.values(), key=len, reverse=True)
+        total_voxels = sum(len(c) for c in comp_list)
+
+        bg_indices: list[int] = []
+        bg_comp_count = 0
+        for comp in comp_list:
+            bg_indices.extend(comp)
+            bg_comp_count += 1
+            if len(bg_indices) >= total_voxels * BG_COVERAGE:
+                break
+
+        # Step 2: Background statistics
+        bg_tokens = tokens[bg_indices]
+        bg_centroid = bg_tokens.mean(axis=0)
+        bg_norm = np.linalg.norm(bg_centroid)
+        if bg_norm < 1e-8:
+            return scores
+        bg_centroid_n = bg_centroid / bg_norm
+
+        bg_cos_dists = 1.0 - bg_tokens @ bg_centroid_n
+        bg_median = float(np.median(bg_cos_dists))
+        bg_mad = float(np.median(np.abs(bg_cos_dists - bg_median)))
+        bg_sigma = bg_mad * 1.4826
+
+        if bg_sigma < 1e-8:
+            bg_sigma = 1e-4
+
+        logger.info("  BG: %d voxels (%d comps, %.0f%%), median_dist=%.4f, sigma=%.4f",
+                     len(bg_indices), bg_comp_count,
+                     len(bg_indices) / total_voxels * 100, bg_median, bg_sigma)
+
+        # Step 3: Score non-background components
+        n_scored = 0
+        for comp in comp_list[bg_comp_count:]:
+            comp_size = len(comp)
+            if comp_size < MIN_ROI_GRID_VOXELS:
+                continue
+
+            comp_tokens = tokens[comp]
+            comp_centroid = comp_tokens.mean(axis=0)
+            comp_norm = np.linalg.norm(comp_centroid)
+            if comp_norm < 1e-8:
+                continue
+            comp_centroid_n = comp_centroid / comp_norm
+
+            # Cosine distance to background
+            d_k = 1.0 - float(comp_centroid_n @ bg_centroid_n)
+
+            # Z-score
+            z_k = max(0.0, (d_k - bg_median) / bg_sigma)
+
+            # Size sigmoid
+            w_k = 1.0 / (1.0 + np.exp(-SIZE_SIGMOID_ALPHA * (comp_size - SIZE_SIGMOID_GAMMA)))
+
+            s_k = z_k * w_k
+            if s_k <= 0:
+                continue
+
+            n_scored += 1
+
+            # Step 4: Intra-component refinement
+            intra_dists = 1.0 - comp_tokens @ comp_centroid_n
+            max_intra = float(intra_dists.max()) + 1e-8
+            refinement = 1.0 - (intra_dists / max_intra)
+
+            for local_idx, global_idx in enumerate(comp):
+                scores[global_idx] = s_k * float(refinement[local_idx])
+
+        return scores
+
+    # -- Thresholding -------------------------------------------------------
+
+    @staticmethod
+    def _threshold_and_normalize(anomaly_volume: np.ndarray) -> np.ndarray:
+        """MAD-based adaptive thresholding + normalization to [0, 1]."""
+        nonzero = anomaly_volume[anomaly_volume > 0]
+        if len(nonzero) == 0:
+            return anomaly_volume
+
+        median_val = float(np.median(nonzero))
+        mad = float(np.median(np.abs(nonzero - median_val)))
+        sigma_mad = mad * 1.4826
+
+        if sigma_mad < 1e-8:
+            sigma_mad = 1e-4
+
+        theta = median_val + 1.5 * sigma_mad
+        score_max = float(anomaly_volume.max())
+
+        logger.info("MAD threshold: median=%.4f, sigma=%.4f, theta=%.4f, max=%.4f",
+                     median_val, sigma_mad, theta, score_max)
+
+        if score_max <= theta:
+            logger.warning("No voxels above MAD threshold -- all zeroed")
+            return np.zeros_like(anomaly_volume)
+
+        normalized = np.clip(
+            (anomaly_volume - theta) / (score_max - theta), 0.0, 1.0
+        ).astype(np.float32)
+
+        n_above = int((anomaly_volume > theta).sum())
+        logger.info("  %d voxels above threshold (%.2f%% of nonzero)",
+                     n_above, n_above / max(len(nonzero), 1) * 100)
+
+        return normalized
+
+    # -- Upsampling (unchanged) ---------------------------------------------
 
     def _upsample_to_original(
         self, score_grid: np.ndarray, orig_shape: tuple, zoom_factors: tuple
     ) -> np.ndarray:
-        """Upsample (16, 16, 16) score grid back to original volume resolution.
-
-        Two-step: first to (224, 224, 224), then to original shape.
-        """
+        """Upsample (16, 16, 16) score grid back to original volume resolution."""
         from scipy.ndimage import zoom
 
-        # Step 1: 16³ → 224³
-        factor_to_224 = TARGET_SIZE / GRID_DIM  # = 14
+        factor_to_224 = TARGET_SIZE / GRID_DIM
         vol_224 = zoom(score_grid, factor_to_224, order=1).astype(np.float32)
 
-        # Step 2: 224³ → original shape
         inv_factors = tuple(1.0 / z for z in zoom_factors)
         return zoom(vol_224, inv_factors, order=1).astype(np.float32)
 
-    def _extract_rois(self, anomaly_volume: np.ndarray) -> tuple:
-        """Extract per-slice ROIs from the 3D anomaly volume.
+    # -- ROI extraction (updated threshold) ---------------------------------
 
-        Returns:
-            (slice_scores, auto_rois, top_slices)
-        """
+    def _extract_rois(self, anomaly_volume: np.ndarray) -> tuple:
+        """Extract per-slice ROIs from the 3D anomaly volume."""
         from scipy.ndimage import label
 
         n_slices, h, w = anomaly_volume.shape
 
-        # Per-slice max scores
         slice_scores = [float(anomaly_volume[i].max()) for i in range(n_slices)]
 
         tissue_scores = anomaly_volume[anomaly_volume > 0]
         if len(tissue_scores) == 0:
             return slice_scores, {}, list(range(min(TOP_K_SLICES, n_slices)))
 
-        # Scores are already μ+Nσ normalized — use low threshold to catch weak anomalies
-        threshold = 0.15
-
         auto_rois: dict[int, dict] = {}
 
         for i in range(n_slices):
             slice_map = anomaly_volume[i]
-            binary = slice_map > threshold
+            binary = slice_map > ROI_2D_THRESHOLD
 
             labeled, n_components = label(binary)
             if n_components == 0:
@@ -552,7 +650,7 @@ class DINOv2CoDeGraphService:
             for comp_id in range(1, n_components + 1):
                 comp_mask = labeled == comp_id
                 area = comp_mask.sum()
-                if area < MIN_COMPONENT_AREA:
+                if area < MIN_ROI_AREA_2D:
                     continue
                 if area > best_area:
                     best_area = area
@@ -579,15 +677,15 @@ class DINOv2CoDeGraphService:
 
         return slice_scores, auto_rois, top_slices
 
-    # ── Heatmap rendering ─────────────────────────────────────────────────
+    # -- Heatmap rendering (unchanged) --------------------------------------
 
     @staticmethod
     def render_heatmap_png(slice_anomaly: np.ndarray) -> bytes:
-        """Render a 2D anomaly map as a heatmap PNG — only anomalous pixels shown."""
+        """Render a 2D anomaly map as a heatmap PNG."""
         import matplotlib.cm as cm
 
         h, w = slice_anomaly.shape
-        colored = cm.hot(slice_anomaly)  # (H, W, 4) float64
+        colored = cm.hot(slice_anomaly)
         rgba = (colored * 255).astype(np.uint8)
 
         visible = slice_anomaly > 0
