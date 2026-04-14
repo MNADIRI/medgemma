@@ -229,6 +229,33 @@ class DINOv2CoDeGraphService:
 
     # -- Volume preparation -------------------------------------------------
 
+    @staticmethod
+    def _get_volume_spacings(session_data: Any) -> tuple[float, float, float]:
+        """Extract (sz, sy, sx) spacings in mm from session data."""
+        # In-plane spacing
+        if session_data.pixel_spacings:
+            row_sp, col_sp = session_data.pixel_spacings[0]
+        else:
+            row_sp, col_sp = 1.0, 1.0
+
+        # Slice spacing from consecutive ImagePositionPatient
+        sz = 1.0
+        if len(session_data.slice_metadata) >= 2:
+            ipp0 = session_data.slice_metadata[0].get("image_position_patient")
+            ipp1 = session_data.slice_metadata[1].get("image_position_patient")
+            if ipp0 is not None and ipp1 is not None:
+                dz = abs(ipp1[2] - ipp0[2])
+                if dz > 0.01:
+                    sz = dz
+                else:
+                    sz = float(np.sqrt(sum((a - b) ** 2 for a, b in zip(ipp1, ipp0))))
+        if sz < 0.01:
+            sz = float((session_data.metadata or {}).get("slice_thickness", 1.0))
+        if sz < 0.01:
+            sz = 1.0
+
+        return (sz, float(row_sp), float(col_sp))
+
     def _prepare_volume(self, session_data: Any):
         """Convert HU arrays to multi-window RGB volume + tissue mask at 224^3.
 
@@ -246,9 +273,25 @@ class DINOv2CoDeGraphService:
         tissue_mask = (hu_vol > TISSUE_HU_LOW) & (hu_vol < TISSUE_HU_HIGH)
         tissue_mask = binary_opening(tissue_mask, iterations=1)
 
+        # Isotropic resampling before going to 224³
+        spacings = self._get_volume_spacings(session_data)
+        s_iso = min(spacings)
+        max_phys = max(d * s for d, s in zip(orig_shape, spacings))
+        s_iso = max(s_iso, max_phys / (TARGET_SIZE * 2))
+
+        iso_factors = tuple(sp / s_iso for sp in spacings)
+        hu_iso = zoom(hu_vol, iso_factors, order=1).astype(np.float32)
+        mask_iso = zoom(tissue_mask.astype(np.float32), iso_factors, order=0) > 0.5
+        iso_shape = hu_iso.shape
+
+        logger.info("Isotropic resample: %s (%.2f/%.2f/%.2f mm) -> %s (%.2f mm)",
+                     orig_shape, *spacings, iso_shape, s_iso)
+
+        # Isotropic -> 224³
         zoom_factors = tuple(TARGET_SIZE / s for s in orig_shape)
-        hu_224 = zoom(hu_vol, zoom_factors, order=1).astype(np.float32)
-        mask_224 = zoom(tissue_mask.astype(np.float32), zoom_factors, order=0) > 0.5
+        vol_224_factors = tuple(TARGET_SIZE / s for s in iso_shape)
+        hu_224 = zoom(hu_iso, vol_224_factors, order=1).astype(np.float32)
+        mask_224 = zoom(mask_iso.astype(np.float32), vol_224_factors, order=0) > 0.5
 
         def window_norm(vol, lo, hi):
             return (np.clip(vol, lo, hi) - lo) / (hi - lo)
