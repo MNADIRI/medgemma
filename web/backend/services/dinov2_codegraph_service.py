@@ -55,6 +55,7 @@ BG_COVERAGE = 0.5                     # background = largest components >= 50%
 SIZE_SIGMOID_ALPHA = 0.5              # size weighting steepness
 SIZE_SIGMOID_GAMMA = 5                # size weighting inflection (voxels)
 MIN_ROI_GRID_VOXELS = 2              # min component size to consider
+LAMBDA_HU = 0.2                      # HU-modulation strength for adaptive tau
 
 # -- ROI extraction ---------------------------------------------------------
 TOP_K_SLICES = 5
@@ -145,7 +146,7 @@ class DINOv2CoDeGraphService:
             raise RuntimeError("DINOv2 model not available")
 
         # Stage A: Prepare volume
-        volume, tissue_mask, orig_shape, zoom_factors = self._prepare_volume(session_data)
+        volume, tissue_mask, orig_shape, zoom_factors, hu_224 = self._prepare_volume(session_data)
         logger.info("Volume prepared: %s -> (224,224,224), tissue coverage: %.1f%%",
                      orig_shape, tissue_mask.mean() * 100)
 
@@ -160,6 +161,13 @@ class DINOv2CoDeGraphService:
 
         if n_valid < 20:
             raise ValueError(f"Too few valid tissue voxels ({n_valid}).")
+
+        # Compute HU grid at 16^3 via block averaging
+        k = PATCH_SIZE
+        hu_grid = hu_224.reshape(
+            GRID_DIM, k, GRID_DIM, k, GRID_DIM, k
+        ).mean(axis=(1, 3, 5)).astype(np.float32)
+        hu_grid_flat = hu_grid.reshape(-1)
 
         # Stage B: Multi-axis DINOv2 feature extraction
         layer_fused: dict[int, list] = {li: [] for li in LAYER_INDICES}
@@ -198,7 +206,7 @@ class DINOv2CoDeGraphService:
                      avg_tokens.shape, norms[valid_mask].min(), norms[valid_mask].max())
 
         # Stages C-E: SCGAD scoring
-        raw_scores = self._scgad_scoring(avg_tokens, valid_mask)
+        raw_scores = self._scgad_scoring(avg_tokens, valid_mask, hu_grid_flat)
 
         # Stage F: Reshape, upsample, threshold, extract ROIs
         score_grid = raw_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
@@ -251,7 +259,7 @@ class DINOv2CoDeGraphService:
         logger.info("Multi-window RGB: brain%s, subdural%s, blood%s, mask HU[%d,%d]",
                      WIN_BRAIN, WIN_SUBDURAL, WIN_BLOOD, TISSUE_HU_LOW, TISSUE_HU_HIGH)
 
-        return volume_rgb, mask_224, orig_shape, zoom_factors
+        return volume_rgb, mask_224, orig_shape, zoom_factors, hu_224
 
     # -- Feature extraction (unchanged) -------------------------------------
 
@@ -353,17 +361,24 @@ class DINOv2CoDeGraphService:
 
     # -- SCGAD scoring (replaces _msm_scoring) ------------------------------
 
-    def _scgad_scoring(self, tokens: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    def _scgad_scoring(
+        self,
+        tokens: np.ndarray,
+        valid_mask: np.ndarray,
+        hu_values: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Spatially-Coherent Graph Anomaly Detection scoring.
 
         Stages C-E of the SCGAD pipeline:
         1. Build 26-connectivity graph with cosine similarity edges
-        2. Multi-scale: for each threshold quantile, decompose + score
-        3. Average scores across scales for consensus
+        2. HU-modulated per-edge adaptive threshold
+        3. Multi-scale: for each threshold quantile, decompose + score
+        4. Average scores across scales for consensus
 
         Args:
             tokens: (4096, 768) float32 L2-normalized
             valid_mask: (4096,) bool
+            hu_values: (4096,) float32 mean HU per grid voxel (optional)
 
         Returns:
             (4096,) float32 anomaly scores (0 for invalid voxels)
@@ -381,8 +396,13 @@ class DINOv2CoDeGraphService:
             np.unravel_index(valid_idx, (GRID_DIM, GRID_DIM, GRID_DIM))
         ).T
 
+        # Extract valid HU values if provided
+        valid_hu = hu_values[valid_idx] if hu_values is not None else None
+
         # Stage C: Build spatial adjacency + compute similarities
-        edges, sims = self._compute_neighbor_similarities(valid_tokens, coords)
+        edges, sims, delta_hus = self._compute_neighbor_similarities(
+            valid_tokens, coords, valid_hu
+        )
         n_edges = len(sims)
 
         if n_edges == 0:
@@ -390,16 +410,32 @@ class DINOv2CoDeGraphService:
             return scores
 
         sims_array = np.array(sims, dtype=np.float32)
+        dhu_array = np.array(delta_hus, dtype=np.float32) if delta_hus is not None else None
 
         logger.info("SCGAD graph: %d nodes, %d edges, sim [%.3f, %.3f], median=%.3f",
                      n_valid, n_edges,
                      sims_array.min(), sims_array.max(), np.median(sims_array))
+        if dhu_array is not None:
+            logger.info("  HU deltas: [%.1f, %.1f], median=%.1f",
+                         dhu_array.min(), dhu_array.max(), np.median(dhu_array))
 
         # Stages D-E: Multi-scale consensus
         scale_scores = []
         for q in THRESHOLD_QUANTILES:
-            tau = float(np.percentile(sims_array, q))
-            components = self._union_find_components(n_valid, edges, sims_array, tau)
+            tau_base = float(np.percentile(sims_array, q))
+
+            # HU-modulated per-edge threshold
+            if dhu_array is not None:
+                dhu_max = dhu_array.max()
+                if dhu_max > 1e-3:
+                    hu_discordance = dhu_array / dhu_max
+                else:
+                    hu_discordance = np.zeros_like(dhu_array)
+                tau_per_edge = tau_base * (1.0 + LAMBDA_HU * hu_discordance)
+            else:
+                tau_per_edge = tau_base
+
+            components = self._union_find_components(n_valid, edges, sims_array, tau_per_edge)
 
             comp_scores = self._score_components(valid_tokens, components)
             scale_scores.append(comp_scores)
@@ -408,8 +444,8 @@ class DINOv2CoDeGraphService:
             sizes = sorted([len(c) for c in components.values()], reverse=True)
             n_scored = int((comp_scores > 0).sum())
             max_s = float(comp_scores.max())
-            logger.info("  P%d: tau=%.4f, %d comps (top sizes: %s), %d scored, max=%.4f",
-                         q, tau, len(components), sizes[:5], n_scored, max_s)
+            logger.info("  P%d: tau_base=%.4f, %d comps (top sizes: %s), %d scored, max=%.4f",
+                         q, tau_base, len(components), sizes[:5], n_scored, max_s)
 
         avg_scores = np.mean(scale_scores, axis=0)
         scores[valid_idx] = avg_scores
@@ -419,11 +455,15 @@ class DINOv2CoDeGraphService:
     def _compute_neighbor_similarities(
         tokens: np.ndarray,
         coords: np.ndarray,
-    ) -> tuple[list[tuple[int, int]], list[float]]:
+        hu_values: np.ndarray | None = None,
+    ) -> tuple[list[tuple[int, int]], list[float], list[float] | None]:
         """Build 26-connectivity adjacency and compute cosine similarities.
 
         Uses spatial hash for O(1) neighbor lookup. Cosine sim = dot product
         since tokens are L2-normalized.
+
+        Returns:
+            (edges, similarities, delta_hus) — delta_hus is None if hu_values is None
         """
         n = len(tokens)
 
@@ -433,6 +473,7 @@ class DINOv2CoDeGraphService:
 
         edges: list[tuple[int, int]] = []
         similarities: list[float] = []
+        delta_hus: list[float] | None = [] if hu_values is not None else None
 
         for i in range(n):
             z, y, x = int(coords[i, 0]), int(coords[i, 1]), int(coords[i, 2])
@@ -442,17 +483,23 @@ class DINOv2CoDeGraphService:
                     sim = float(tokens[i] @ tokens[j])
                     edges.append((i, j))
                     similarities.append(sim)
+                    if delta_hus is not None:
+                        delta_hus.append(abs(float(hu_values[i]) - float(hu_values[j])))
 
-        return edges, similarities
+        return edges, similarities, delta_hus
 
     @staticmethod
     def _union_find_components(
         n: int,
         edges: list[tuple[int, int]],
         sims: np.ndarray,
-        tau: float,
+        tau: np.ndarray | float,
     ) -> dict[int, list[int]]:
-        """Union-Find with path halving. Connect edges where sim >= tau."""
+        """Union-Find with path halving. Connect edges where sim >= tau.
+
+        tau can be a scalar float (uniform threshold) or a per-edge ndarray
+        (HU-modulated adaptive threshold).
+        """
         parent = list(range(n))
         rank = [0] * n
 
@@ -472,8 +519,10 @@ class DINOv2CoDeGraphService:
             if rank[ra] == rank[rb]:
                 rank[ra] += 1
 
+        per_edge = isinstance(tau, np.ndarray)
         for idx in range(len(edges)):
-            if sims[idx] >= tau:
+            threshold = tau[idx] if per_edge else tau
+            if sims[idx] >= threshold:
                 union(edges[idx][0], edges[idx][1])
 
         components: dict[int, list[int]] = defaultdict(list)
