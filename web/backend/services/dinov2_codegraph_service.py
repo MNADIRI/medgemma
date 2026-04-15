@@ -1,25 +1,14 @@
 """DINOv2 + SCGAD anomaly detection service.
 
 Spatially-Coherent Graph Anomaly Detection (SCGAD) for single-volume
-brain CT, replacing the MSM self-referencing approach:
+brain CT:
   1. DINOv2 ViT-L/14 multi-layer feature extraction (3 axes)
-  2. Multi-window RGB encoding: Brain [0,80], Subdural [-20,180], Blood [20,60] HU
-  3. Depth pooling (224->16) + L2 normalization + axis permutation -> 16^3 grid
-  4. Random projection (1024->256) per axis per layer, concatenated -> 768-dim
-  5. Multi-layer feature AVERAGING -> L2 normalization -> single 768-dim token set
-  6. SCGAD scoring:
-     a. Build spatial coherence graph (26-connectivity + cosine similarity)
-     b. Adaptive threshold (percentile of neighbor similarities)
-     c. Union-Find connected component decomposition
-     d. Component scoring: background identification + cosine contrast + size weighting
-     e. Multi-scale consensus (3 thresholds) -> mean score
-  7. MAD-based adaptive threshold -> per-slice ROI extraction
-
-Key advantages over MSM:
-  - O(n) scoring vs O(n^2) pairwise distances
-  - No GPU needed for scoring stage (CPU numpy only)
-  - Exploits spatial structure of lesions (contiguity + internal homogeneity)
-  - Robust to self-referencing artifacts (hemorrhage no longer matches distant tissue)
+  2. Multi-window RGB encoding: Brain [0,80], Subdural [-20,180], Blood [20,80] HU
+  3. Top-3 depth pooling (224->16) + L2 norm + axis permutation -> 16^3 grid
+  4. Random projection (1024->256) per axis per layer -> 768-dim
+  5. Multi-layer feature averaging -> L2 norm -> single token set
+  6. SCGAD scoring with HU-modulated adaptive threshold
+  7. MAD-based threshold -> ROI extraction
 """
 
 import io
@@ -40,14 +29,22 @@ LAYER_INDICES = [6, 12, 18, 24]       # 4 layers for ViT-L (24 total)
 TARGET_SIZE = 224                      # resample volume to 224^3
 GRID_DIM = TARGET_SIZE // PATCH_SIZE  # = 16 tokens per axis
 
-# -- CT multi-window RGB encoding (unchanged) -------------------------------
+# -- CT multi-window RGB -------------------------------------------------------
 WIN_BRAIN = (0, 80)       # R: brain parenchyma (L=40, W=80)
 WIN_SUBDURAL = (-20, 180) # G: subdural/wide (L=80, W=200)
-WIN_BLOOD = (20, 60)      # B: narrow blood (L=40, W=40)
+WIN_BLOOD = (20, 80)      # B: blood window (70 HU hemorrhage at 0.83, not saturated)
 
-# -- Tissue mask - wider range than previous [0, 100] ----------------------
-TISSUE_HU_LOW = -20       # includes CSF (0-15 HU)
-TISSUE_HU_HIGH = 200      # includes calcifications, excludes compact bone
+# -- Tissue mask ----------------------------------------------------------------
+# Tighter than [-20,200]: excludes skull bone (>80 HU) that contaminates the
+# graph with extreme HU deltas. Brain tissue: CSF 5-15, WM 25-35, GM 35-45,
+# blood 50-80 HU.
+TISSUE_HU_LOW = -10
+TISSUE_HU_HIGH = 80
+
+# -- Grid mask strictness -------------------------------------------------------
+# Minimum fraction of tissue voxels within a 14^3 patch for the grid voxel
+# to be considered valid. Replaces max_pool3d (any single tissue voxel = valid).
+GRID_MASK_TISSUE_FRAC = 0.3
 
 # -- SCGAD scoring parameters ----------------------------------------------
 THRESHOLD_QUANTILES = (15, 25, 35)    # multi-scale consensus (3 passes)
@@ -152,24 +149,38 @@ class DINOv2CoDeGraphService:
         logger.info("Volume prepared: %s -> (224,224,224), tissue coverage: %.1f%%",
                      orig_shape, tissue_mask.mean() * 100)
 
-        # Grid mask via max pooling
+        # Grid mask via avg pooling with tissue fraction threshold
         mask_tensor = torch.from_numpy(tissue_mask.astype(np.float32))
         mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
-        pooled_mask = F.max_pool3d(mask_tensor, kernel_size=PATCH_SIZE, stride=PATCH_SIZE)
-        valid_mask = (pooled_mask.squeeze() > 0).view(-1).numpy()
+        pooled_mask = F.avg_pool3d(mask_tensor, kernel_size=PATCH_SIZE, stride=PATCH_SIZE)
+        valid_mask = (pooled_mask.squeeze() > GRID_MASK_TISSUE_FRAC).view(-1).numpy()
         n_valid = valid_mask.sum()
-        logger.info("3D token mask: %d/%d valid voxels (%.1f%%)",
-                     n_valid, GRID_DIM ** 3, n_valid / GRID_DIM ** 3 * 100)
+        logger.info("3D token mask: %d/%d valid voxels (%.1f%%, threshold=%.0f%%)",
+                     n_valid, GRID_DIM ** 3, n_valid / GRID_DIM ** 3 * 100,
+                     GRID_MASK_TISSUE_FRAC * 100)
 
         if n_valid < 20:
             raise ValueError(f"Too few valid tissue voxels ({n_valid}).")
 
-        # Compute HU grid at 16^3 via block averaging
+        # Compute HU grid at 16^3 via masked mean (tissue voxels only)
         k = PATCH_SIZE
-        hu_grid = hu_224.reshape(
+        mask_224_f = tissue_mask.astype(np.float32)
+        hu_masked = hu_224 * mask_224_f
+
+        hu_sum = hu_masked.reshape(
             GRID_DIM, k, GRID_DIM, k, GRID_DIM, k
-        ).mean(axis=(1, 3, 5)).astype(np.float32)
+        ).sum(axis=(1, 3, 5))
+        mask_count = mask_224_f.reshape(
+            GRID_DIM, k, GRID_DIM, k, GRID_DIM, k
+        ).sum(axis=(1, 3, 5))
+        hu_grid = np.where(mask_count > 0, hu_sum / mask_count, 0.0).astype(np.float32)
         hu_grid_flat = hu_grid.reshape(-1)
+
+        valid_hu_stats = hu_grid_flat[valid_mask]
+        if len(valid_hu_stats) > 0:
+            logger.info("HU grid (valid): [%.1f, %.1f], median=%.1f, mean=%.1f",
+                         valid_hu_stats.min(), valid_hu_stats.max(),
+                         np.median(valid_hu_stats), valid_hu_stats.mean())
 
         # Stage B: Multi-axis DINOv2 feature extraction
         layer_fused: dict[int, list] = {li: [] for li in LAYER_INDICES}
@@ -204,7 +215,7 @@ class DINOv2CoDeGraphService:
         norms = np.linalg.norm(avg_tokens, axis=1, keepdims=True)
         avg_tokens = avg_tokens / (norms + 1e-6)
 
-        logger.info("Feature extraction complete: tokens %s, norm range [%.3f, %.3f]",
+        logger.info("Feature extraction complete: tokens %s, norm range [%.4f, %.4f]",
                      avg_tokens.shape, norms[valid_mask].min(), norms[valid_mask].max())
 
         # Stages C-E: SCGAD scoring
@@ -257,10 +268,7 @@ class DINOv2CoDeGraphService:
         return (sz, float(row_sp), float(col_sp))
 
     def _prepare_volume(self, session_data: Any):
-        """Convert HU arrays to multi-window RGB volume + tissue mask at 224^3.
-
-        Tissue mask: [-20, 200] HU (wider than original [0, 100]).
-        """
+        """Convert HU arrays to multi-window RGB volume + tissue mask at 224^3."""
         from scipy.ndimage import binary_opening, zoom
 
         hu_arrays = session_data.hu_arrays
@@ -271,7 +279,7 @@ class DINOv2CoDeGraphService:
         orig_shape = hu_vol.shape
 
         tissue_mask = (hu_vol > TISSUE_HU_LOW) & (hu_vol < TISSUE_HU_HIGH)
-        tissue_mask = binary_opening(tissue_mask, iterations=1)
+        tissue_mask = binary_opening(tissue_mask, iterations=2)
 
         # Isotropic resampling before going to 224³
         spacings = self._get_volume_spacings(session_data)
@@ -396,13 +404,32 @@ class DINOv2CoDeGraphService:
 
     @staticmethod
     def _pool_along_depth(tokens):
-        """Average-pool tokens along the depth (slice) dimension."""
+        """Top-3 depth pooling: keep the 3 most salient slices out of 14.
+
+        Replaces mean pooling which diluted focal lesion features.
+        A hemorrhage on 3-5 slices out of 14 was diluted to ~25-35% signal.
+        Top-3 by L2 norm preserves the most distinctive slice features.
+        """
+        import torch
+
         d, npatches, dtoken = tokens.shape
         k = PATCH_SIZE
         if d % k != 0:
             tokens = tokens[:d - (d % k)]
             d = tokens.shape[0]
-        return tokens.view(d // k, k, npatches, dtoken).mean(dim=1)
+
+        grouped = tokens.view(d // k, k, npatches, dtoken)  # (16, 14, 256, 1024)
+        n_groups, depth, n_p, dim = grouped.shape
+
+        # Select top-3 slices per spatial position by token norm
+        token_norms = grouped.norm(dim=-1)  # (16, 14, 256)
+        top_k = min(3, depth)
+        _, top_indices = token_norms.topk(top_k, dim=1)  # (16, 3, 256)
+
+        # Gather and average the top-3 tokens
+        top_indices_expanded = top_indices.unsqueeze(-1).expand(-1, -1, -1, dim)
+        selected = torch.gather(grouped, 1, top_indices_expanded)  # (16, 3, 256, 1024)
+        return selected.mean(dim=1)  # (16, 256, 1024)
 
     # -- SCGAD scoring (replaces _msm_scoring) ------------------------------
 
