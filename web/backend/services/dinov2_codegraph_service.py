@@ -185,6 +185,9 @@ class DINOv2CoDeGraphService:
         # Stage B: Multi-axis DINOv2 feature extraction
         layer_fused: dict[int, list] = {li: [] for li in LAYER_INDICES}
 
+        # DIAGNOSTIC: save one raw pre-projection token set (last layer, axial)
+        _diag_raw_1024 = None
+
         for axis_name in ("axial", "coronal", "sagittal"):
             logger.info("Encoding %s slices (all layers)...", axis_name)
             slices = self._collect_axis_slices(volume, axis_name)
@@ -196,6 +199,11 @@ class DINOv2CoDeGraphService:
                 flat = grid_tokens.reshape(-1, EMBED_DIM)
                 if isinstance(flat, torch.Tensor):
                     flat = flat.cpu().float().numpy()
+
+                # DIAGNOSTIC: capture raw 1024-dim tokens (layer 24, axial only)
+                if axis_name == "axial" and layer_idx == LAYER_INDICES[-1]:
+                    _diag_raw_1024 = flat.copy()
+
                 proj = flat @ self._proj_matrices[layer_idx]
                 layer_fused[layer_idx].append(proj)
 
@@ -208,7 +216,15 @@ class DINOv2CoDeGraphService:
             fused = np.concatenate(layer_fused[layer_idx], axis=1).astype(np.float32)
             layer_tokens_768.append(fused)
 
-        avg_tokens = np.mean(layer_tokens_768, axis=0)  # (4096, 768)
+        # DIAGNOSTIC: check per-layer discriminability before averaging
+        self._diagnostic_per_layer(layer_tokens_768, valid_mask, hu_grid_flat)
+
+        avg_tokens = np.mean(layer_tokens_768, axis=0)
+
+        # DIAGNOSTIC: check averaged (pre-L2-norm) discriminability
+        self._diagnostic_stage(avg_tokens, valid_mask, hu_grid_flat,
+                               "Averaged 768-dim (pre-L2-norm)")
+
         del layer_fused, layer_tokens_768
 
         # L2 normalize -- critical for cosine similarity in graph
@@ -217,6 +233,19 @@ class DINOv2CoDeGraphService:
 
         logger.info("Feature extraction complete: tokens %s, norm range [%.4f, %.4f]",
                      avg_tokens.shape, norms[valid_mask].min(), norms[valid_mask].max())
+
+        # DIAGNOSTIC: check final (post-L2-norm) discriminability
+        self._diagnostic_stage(avg_tokens, valid_mask, hu_grid_flat,
+                               "Final 768-dim (post-L2-norm)")
+
+        # DIAGNOSTIC: check raw 1024-dim tokens (pre-projection)
+        if _diag_raw_1024 is not None:
+            raw_normed = _diag_raw_1024.copy()
+            raw_norms = np.linalg.norm(raw_normed, axis=1, keepdims=True)
+            raw_normed = raw_normed / (raw_norms + 1e-6)
+            self._diagnostic_stage(raw_normed, valid_mask, hu_grid_flat,
+                                   "Raw 1024-dim L24-axial (pre-projection)")
+            del _diag_raw_1024
 
         # Stages C-E: SCGAD scoring
         raw_scores = self._scgad_scoring(avg_tokens, valid_mask, hu_grid_flat)
@@ -431,7 +460,134 @@ class DINOv2CoDeGraphService:
         selected = torch.gather(grouped, 1, top_indices_expanded)  # (16, 3, 256, 1024)
         return selected.mean(dim=1)  # (16, 256, 1024)
 
-    # -- SCGAD scoring (replaces _msm_scoring) ------------------------------
+    # -- Pipeline diagnostics --------------------------------------------------
+
+    @staticmethod
+    def _diagnostic_stage(
+        tokens: np.ndarray,
+        valid_mask: np.ndarray,
+        hu_flat: np.ndarray,
+        stage_name: str,
+    ) -> None:
+        """Check feature discriminability at one pipeline stage.
+
+        Uses HU values to identify potentially abnormal voxels (>2 MAD from
+        median), then compares cosine similarities between normal-normal and
+        suspicious-normal neighbor pairs. A gap > 0.05 indicates the features
+        carry discriminative signal at this stage.
+        """
+        valid_idx = np.where(valid_mask)[0]
+        if len(valid_idx) < 30:
+            return
+
+        valid_tokens = tokens[valid_idx]
+        valid_hu = hu_flat[valid_idx]
+
+        # Identify suspicious voxels by HU
+        hu_med = float(np.median(valid_hu))
+        hu_mad = float(np.median(np.abs(valid_hu - hu_med)))
+        hu_sig = hu_mad * 1.4826
+        if hu_sig < 1e-4:
+            hu_sig = 1e-4
+
+        susp_local = set(i for i in range(len(valid_idx))
+                         if abs(valid_hu[i] - hu_med) > 2.0 * hu_sig)
+        norm_local = set(range(len(valid_idx))) - susp_local
+
+        if len(susp_local) < 2 or len(norm_local) < 10:
+            logger.info("DIAG [%s]: <2 suspicious voxels (HU threshold=%.1f±%.1f) — skip",
+                         stage_name, hu_med, 2 * hu_sig)
+            return
+
+        # Sample cosine similarities: normal-normal vs suspicious-normal
+        rng = np.random.RandomState(0)
+        norm_list = list(norm_local)
+        susp_list = list(susp_local)
+
+        # Normal-Normal: 200 random pairs
+        nn_sims = []
+        for _ in range(min(200, len(norm_list) * (len(norm_list) - 1) // 2)):
+            a, b = rng.choice(norm_list, 2, replace=False)
+            nn_sims.append(float(valid_tokens[a] @ valid_tokens[b]))
+
+        # Suspicious-Normal: all suspicious × sample of normals
+        sn_sims = []
+        for s in susp_list:
+            sample_n = rng.choice(norm_list, min(20, len(norm_list)), replace=False)
+            for n in sample_n:
+                sn_sims.append(float(valid_tokens[s] @ valid_tokens[n]))
+
+        # Suspicious-Suspicious
+        ss_sims = []
+        if len(susp_list) >= 2:
+            for i in range(len(susp_list)):
+                for j in range(i + 1, len(susp_list)):
+                    ss_sims.append(float(valid_tokens[susp_list[i]] @ valid_tokens[susp_list[j]]))
+
+        nn_med = float(np.median(nn_sims)) if nn_sims else 0.0
+        sn_med = float(np.median(sn_sims)) if sn_sims else 0.0
+        ss_med = float(np.median(ss_sims)) if ss_sims else 0.0
+        gap = nn_med - sn_med
+
+        verdict = "GOOD" if gap > 0.05 else "WEAK" if gap > 0.02 else "NONE"
+
+        logger.info("DIAG [%s]: %d suspicious (HU>%.0f), %d normal",
+                     stage_name, len(susp_local), hu_med + 2 * hu_sig, len(norm_local))
+        logger.info("  Cosine sim — NN: %.3f, SN: %.3f, SS: %.3f | gap=%.4f → %s",
+                     nn_med, sn_med, ss_med, gap, verdict)
+
+    @staticmethod
+    def _diagnostic_per_layer(
+        layer_tokens: list[np.ndarray],
+        valid_mask: np.ndarray,
+        hu_flat: np.ndarray,
+    ) -> None:
+        """Check discriminability for each DINOv2 layer independently."""
+        valid_idx = np.where(valid_mask)[0]
+        if len(valid_idx) < 30:
+            return
+
+        valid_hu = hu_flat[valid_idx]
+        hu_med = float(np.median(valid_hu))
+        hu_mad = float(np.median(np.abs(valid_hu - hu_med)))
+        hu_sig = hu_mad * 1.4826
+        if hu_sig < 1e-4:
+            hu_sig = 1e-4
+
+        susp_local = set(i for i in range(len(valid_idx))
+                         if abs(valid_hu[i] - hu_med) > 2.0 * hu_sig)
+        norm_local = set(range(len(valid_idx))) - susp_local
+
+        if len(susp_local) < 2 or len(norm_local) < 10:
+            return
+
+        rng = np.random.RandomState(0)
+        norm_list = list(norm_local)
+        susp_list = list(susp_local)
+
+        for li_idx, (layer_idx, toks) in enumerate(zip(LAYER_INDICES, layer_tokens)):
+            vt = toks[valid_idx]
+            # L2 normalize for cosine
+            norms = np.linalg.norm(vt, axis=1, keepdims=True)
+            vt = vt / (norms + 1e-6)
+
+            # Sample NN and SN
+            nn = [float(vt[a] @ vt[b])
+                  for a, b in [rng.choice(norm_list, 2, replace=False) for _ in range(100)]]
+            sn = []
+            for s in susp_list[:10]:
+                for n in rng.choice(norm_list, min(10, len(norm_list)), replace=False):
+                    sn.append(float(vt[s] @ vt[n]))
+
+            nn_med = float(np.median(nn))
+            sn_med = float(np.median(sn)) if sn else nn_med
+            gap = nn_med - sn_med
+            verdict = "GOOD" if gap > 0.05 else "WEAK" if gap > 0.02 else "NONE"
+
+            logger.info("DIAG [Layer %d, 768-dim]: NN=%.3f, SN=%.3f, gap=%.4f → %s",
+                         layer_idx, nn_med, sn_med, gap, verdict)
+
+    # -- SCGAD scoring ----------------------------------------------------------
 
     def _scgad_scoring(
         self,
@@ -519,6 +675,43 @@ class DINOv2CoDeGraphService:
         else:
             hu_discordance = None
 
+        # DIAGNOSTIC: Edge-level analysis — categorize by HU group
+        if valid_hu is not None:
+            hu_med = float(np.median(valid_hu))
+            hu_mad_val = float(np.median(np.abs(valid_hu - hu_med)))
+            hu_sig_val = hu_mad_val * 1.4826
+            if hu_sig_val < 1e-4:
+                hu_sig_val = 1e-4
+            susp_set = set(i for i in range(n_valid) if abs(valid_hu[i] - hu_med) > 2.0 * hu_sig_val)
+
+            if susp_set:
+                nn_e, sn_e, ss_e = [], [], []
+                for idx, (i, j) in enumerate(edges):
+                    si, sj = i in susp_set, j in susp_set
+                    if si and sj:
+                        ss_e.append(sims_array[idx])
+                    elif si or sj:
+                        sn_e.append(sims_array[idx])
+                    else:
+                        nn_e.append(sims_array[idx])
+
+                nn_m = float(np.median(nn_e)) if nn_e else 0.0
+                sn_m = float(np.median(sn_e)) if sn_e else 0.0
+                ss_m = float(np.median(ss_e)) if ss_e else 0.0
+                gap = nn_m - sn_m
+
+                logger.info("DIAG [Graph edges]: %d suspicious voxels, "
+                             "NN(%d)=%.3f, SN(%d)=%.3f, SS(%d)=%.3f, gap=%.4f → %s",
+                             len(susp_set),
+                             len(nn_e), nn_m, len(sn_e), sn_m, len(ss_e), ss_m,
+                             gap,
+                             "GOOD" if gap > 0.05 else "WEAK" if gap > 0.02 else "NONE")
+
+                # Log suspicious voxel HU values
+                susp_hus = [valid_hu[i] for i in susp_set]
+                logger.info("DIAG [Suspicious HU]: values=%s",
+                             [f"{h:.1f}" for h in sorted(susp_hus, reverse=True)[:20]])
+
         # Stages D-E: Multi-scale consensus
         scale_scores = []
         for q in THRESHOLD_QUANTILES:
@@ -532,10 +725,9 @@ class DINOv2CoDeGraphService:
 
             components = self._union_find_components(n_valid, edges, sims_array, tau_per_edge)
 
-            comp_scores = self._score_components(valid_tokens, components, edges)
+            comp_scores = self._score_components(valid_tokens, components, edges, valid_hu)
             scale_scores.append(comp_scores)
 
-            # Diagnostics
             sizes = sorted([len(c) for c in components.values()], reverse=True)
             n_scored = int((comp_scores > 0).sum())
             max_s = float(comp_scores.max())
@@ -631,14 +823,13 @@ class DINOv2CoDeGraphService:
         tokens: np.ndarray,
         components: dict[int, list[int]],
         edges: list[tuple[int, int]] | None = None,
+        hu_values: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Score voxels by their component's contrast to the background.
+        """Score voxels by component contrast to background.
 
-        1. Background = largest components covering >= BG_COVERAGE
-        2. Background centroid + MAD-based dispersion
-        3. Non-background components: cosine distance z-score * size sigmoid
-        4. Intra-component refinement: core voxels > edge voxels
-        5. Lesion cluster agglomeration: merge adjacent scored components
+        Uses DUAL z-scoring: feature distance AND HU deviation.
+        The max of the two z-scores is used — so a hemorrhage that is
+        feature-similar to parenchyma but HU-different will still score.
         """
         n = tokens.shape[0]
         scores = np.zeros(n, dtype=np.float32)
@@ -658,7 +849,7 @@ class DINOv2CoDeGraphService:
             if len(bg_indices) >= total_voxels * BG_COVERAGE:
                 break
 
-        # Step 2: Background statistics
+        # Step 2: Background feature statistics
         bg_tokens = tokens[bg_indices]
         bg_centroid = bg_tokens.mean(axis=0)
         bg_norm = np.linalg.norm(bg_centroid)
@@ -667,16 +858,30 @@ class DINOv2CoDeGraphService:
         bg_centroid_n = bg_centroid / bg_norm
 
         bg_cos_dists = 1.0 - bg_tokens @ bg_centroid_n
-        bg_median = float(np.median(bg_cos_dists))
-        bg_mad = float(np.median(np.abs(bg_cos_dists - bg_median)))
-        bg_sigma = bg_mad * 1.4826
+        bg_feat_median = float(np.median(bg_cos_dists))
+        bg_feat_mad = float(np.median(np.abs(bg_cos_dists - bg_feat_median)))
+        bg_feat_sigma = bg_feat_mad * 1.4826
+        if bg_feat_sigma < 1e-8:
+            bg_feat_sigma = 1e-4
 
-        if bg_sigma < 1e-8:
-            bg_sigma = 1e-4
+        # Step 2b: Background HU statistics (if available)
+        bg_hu_median = 0.0
+        bg_hu_sigma = 1e-4
+        has_hu = hu_values is not None
+        if has_hu:
+            bg_hu_vals = hu_values[bg_indices]
+            bg_hu_median = float(np.median(bg_hu_vals))
+            bg_hu_mad = float(np.median(np.abs(bg_hu_vals - bg_hu_median)))
+            bg_hu_sigma = bg_hu_mad * 1.4826
+            if bg_hu_sigma < 1e-8:
+                bg_hu_sigma = 1e-4
 
-        logger.info("  BG: %d voxels (%d comps, %.0f%%), median_dist=%.4f, sigma=%.4f",
+        logger.info("  BG: %d voxels (%d comps, %.0f%%), feat(med=%.4f, σ=%.4f), "
+                     "HU(med=%.1f, σ=%.1f)",
                      len(bg_indices), bg_comp_count,
-                     len(bg_indices) / total_voxels * 100, bg_median, bg_sigma)
+                     len(bg_indices) / total_voxels * 100,
+                     bg_feat_median, bg_feat_sigma,
+                     bg_hu_median, bg_hu_sigma)
 
         # Step 3: Score non-background components
         n_scored = 0
@@ -692,22 +897,38 @@ class DINOv2CoDeGraphService:
                 continue
             comp_centroid_n = comp_centroid / comp_norm
 
-            # Cosine distance to background
+            # Feature z-score: cosine distance to background centroid
             d_k = 1.0 - float(comp_centroid_n @ bg_centroid_n)
+            feat_z = max(0.0, (d_k - bg_feat_median) / bg_feat_sigma)
 
-            # Z-score
-            z_k = max(0.0, (d_k - bg_median) / bg_sigma)
+            # HU z-score: absolute HU deviation from background median
+            hu_z = 0.0
+            comp_hu_mean = 0.0
+            if has_hu:
+                comp_hu_mean = float(np.mean(hu_values[comp]))
+                hu_z = abs(comp_hu_mean - bg_hu_median) / bg_hu_sigma
+
+            # Combined z-score: max of feature and HU signals
+            # Either signal alone is sufficient to flag the component
+            z_combined = max(feat_z, hu_z)
 
             # Size sigmoid
             w_k = 1.0 / (1.0 + np.exp(-SIZE_SIGMOID_ALPHA * (comp_size - SIZE_SIGMOID_GAMMA)))
 
-            s_k = z_k * w_k
+            s_k = z_combined * w_k
+
+            # Log each non-bg component for diagnostics
+            logger.info("    Comp size=%d: feat_d=%.4f feat_z=%.2f, "
+                         "HU=%.1f hu_z=%.2f, combined_z=%.2f, w=%.2f, score=%.4f",
+                         comp_size, d_k, feat_z,
+                         comp_hu_mean, hu_z, z_combined, w_k, s_k)
+
             if s_k <= 0:
                 continue
 
             n_scored += 1
 
-            # Step 4: Intra-component refinement
+            # Intra-component refinement
             intra_dists = 1.0 - comp_tokens @ comp_centroid_n
             max_intra = float(intra_dists.max()) + 1e-8
             refinement = 1.0 - (intra_dists / max_intra)
@@ -754,6 +975,83 @@ class DINOv2CoDeGraphService:
                         max_score = max(scores[v] for v in cluster)
                         for v in cluster:
                             scores[v] = max_score
+
+        # Step 6: HU outlier fallback — catches lesions trapped in background
+        # When DINOv2 features fail to separate hemorrhage from parenchyma,
+        # the graph keeps them connected in one big component. This step
+        # scans the background for voxels whose HU deviates significantly
+        # from the background distribution, clusters them spatially, and
+        # scores the clusters. This is the safety net.
+        if has_hu and edges is not None:
+            bg_hu_vals = hu_values[bg_indices]
+            bg_hu_med = float(np.median(bg_hu_vals))
+            bg_hu_mad = float(np.median(np.abs(bg_hu_vals - bg_hu_med)))
+            bg_hu_sig = bg_hu_mad * 1.4826
+            if bg_hu_sig < 1e-4:
+                bg_hu_sig = 1e-4
+
+            # Find HU outliers in background (|z| > 2.0)
+            bg_set = set(bg_indices)
+            outlier_voxels = set()
+            for v in bg_indices:
+                hz = abs(hu_values[v] - bg_hu_med) / bg_hu_sig
+                if hz > 2.0:
+                    outlier_voxels.add(v)
+
+            if len(outlier_voxels) >= MIN_ROI_GRID_VOXELS:
+                # Cluster outliers by spatial adjacency (reuse edges)
+                outlier_edges = [
+                    (i, j) for i, j in edges
+                    if i in outlier_voxels and j in outlier_voxels
+                ]
+                # Mini union-find on outlier voxels
+                ol_parent = {v: v for v in outlier_voxels}
+                ol_rank = {v: 0 for v in outlier_voxels}
+
+                def ol_find(x):
+                    while ol_parent[x] != x:
+                        ol_parent[x] = ol_parent[ol_parent[x]]
+                        x = ol_parent[x]
+                    return x
+
+                def ol_union(a, b):
+                    ra, rb = ol_find(a), ol_find(b)
+                    if ra == rb:
+                        return
+                    if ol_rank[ra] < ol_rank[rb]:
+                        ra, rb = rb, ra
+                    ol_parent[rb] = ra
+                    if ol_rank[ra] == ol_rank[rb]:
+                        ol_rank[ra] += 1
+
+                for i, j in outlier_edges:
+                    ol_union(i, j)
+
+                ol_clusters: dict[int, list[int]] = defaultdict(list)
+                for v in outlier_voxels:
+                    ol_clusters[ol_find(v)].append(v)
+
+                n_hu_scored = 0
+                for cluster in ol_clusters.values():
+                    csize = len(cluster)
+                    if csize < MIN_ROI_GRID_VOXELS:
+                        continue
+                    cluster_hu = float(np.mean(hu_values[cluster]))
+                    hz = abs(cluster_hu - bg_hu_med) / bg_hu_sig
+                    w = 1.0 / (1.0 + np.exp(-SIZE_SIGMOID_ALPHA * (csize - SIZE_SIGMOID_GAMMA)))
+                    s = hz * w
+                    if s <= 0:
+                        continue
+                    n_hu_scored += 1
+                    logger.info("    HU-outlier cluster: size=%d, HU=%.1f, z=%.2f, "
+                                 "w=%.2f, score=%.4f",
+                                 csize, cluster_hu, hz, w, s)
+                    for v in cluster:
+                        scores[v] = max(scores[v], s)
+
+                if n_hu_scored > 0:
+                    logger.info("  HU fallback: %d outlier voxels, %d clusters scored",
+                                 len(outlier_voxels), n_hu_scored)
 
         return scores
 
