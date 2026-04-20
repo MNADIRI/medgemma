@@ -35,11 +35,16 @@ WIN_SUBDURAL = (-20, 180) # G: subdural/wide (L=80, W=200)
 WIN_BLOOD = (20, 80)      # B: blood window (70 HU hemorrhage at 0.83, not saturated)
 
 # -- Tissue mask ----------------------------------------------------------------
-# Tighter than [-20,200]: excludes skull bone (>80 HU) that contaminates the
-# graph with extreme HU deltas. Brain tissue: CSF 5-15, WM 25-35, GM 35-45,
-# blood 50-80 HU.
+# Includes CSF (5-15), WM (25-35), GM (35-45), acute blood (50-90 HU).
+# Skull-stripping removes extracranial tissue; upper bound at 100 captures
+# hemorrhage without reaching cortical bone (>200 HU).
 TISSUE_HU_LOW = -10
-TISSUE_HU_HIGH = 80
+TISSUE_HU_HIGH = 100
+
+# -- Skull-stripping parameters -------------------------------------------------
+BONE_HU_THRESHOLD = 150       # dense cortical bone (skull)
+BRAIN_MASK_CLOSING_MM = 10    # closing radius to seal skull gaps (foramen, sutures)
+BRAIN_MASK_EROSION_MM = 3     # erosion to pull away from inner skull table
 
 # -- Grid mask strictness -------------------------------------------------------
 # Minimum fraction of tissue voxels within a 14^3 patch for the grid voxel
@@ -55,6 +60,14 @@ MIN_ROI_GRID_VOXELS = 2              # min component size to consider
 LAMBDA_HU = 0.2                      # HU-modulation strength for adaptive tau
 HU_DISCORDANCE_EPS = 1.0             # noise floor (1 HU ≈ CT reconstruction noise)
 HU_DISCORDANCE_MAX = 3.0             # clamp to prevent extreme threshold values
+
+# -- CSF exemption parameters -----------------------------------------------
+CSF_HU_LOW = -5
+CSF_HU_HIGH = 20
+CSF_MIN_VOXELS = 8           # min grid voxels for a CSF region (ventricles are large)
+
+# -- Asymmetry parameters ---------------------------------------------------
+ASYM_WEIGHT = 0.5            # weight of asymmetry modulation on scores
 
 # -- ROI extraction ---------------------------------------------------------
 TOP_K_SLICES = 5
@@ -247,8 +260,16 @@ class DINOv2CoDeGraphService:
                                    "Raw 1024-dim L24-axial (pre-projection)")
             del _diag_raw_1024
 
+        # Hemispheric asymmetry: boost unilateral, suppress bilateral
+        asym_scores = self._compute_asymmetry(hu_grid_flat, valid_mask)
+
         # Stages C-E: SCGAD scoring
         raw_scores = self._scgad_scoring(avg_tokens, valid_mask, hu_grid_flat)
+
+        # Modulate by asymmetry: score * (1 + ASYM_WEIGHT * asymmetry)
+        # Unilateral findings (asym~1) get boosted by up to 50%
+        # Bilateral findings (asym~0, e.g. ventricles) stay unchanged
+        raw_scores = raw_scores * (1.0 + ASYM_WEIGHT * asym_scores)
 
         # Stage F: Reshape, upsample, threshold, extract ROIs
         score_grid = raw_scores.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
@@ -296,6 +317,59 @@ class DINOv2CoDeGraphService:
 
         return (sz, float(row_sp), float(col_sp))
 
+    @staticmethod
+    def _extract_brain_mask(hu_vol: np.ndarray, voxel_size_mm: float = 1.0) -> np.ndarray:
+        """Morphological skull-stripping to isolate intracranial contents.
+
+        1. Find skull boundary via bone HU threshold (>150)
+        2. Close gaps in skull (foramen magnum, sutures) with large structuring element
+        3. Fill interior per axial slice to get intracranial cavity
+        4. Erode to pull away from inner skull table
+        5. Intersect with tissue HU mask
+        """
+        from scipy.ndimage import (
+            binary_closing, binary_dilation, binary_erosion,
+            binary_fill_holes, generate_binary_structure, label,
+        )
+
+        bone_mask = hu_vol > BONE_HU_THRESHOLD
+
+        # Close gaps in the skull shell so fill_holes works
+        close_r = max(1, int(round(BRAIN_MASK_CLOSING_MM / voxel_size_mm)))
+        struct_3d = generate_binary_structure(3, 2)
+        skull_closed = binary_closing(bone_mask, structure=struct_3d, iterations=close_r)
+
+        # Fill interior per axial slice (more robust than 3D fill for partial volumes)
+        intracranial = np.zeros_like(skull_closed)
+        for z in range(skull_closed.shape[0]):
+            slice_2d = skull_closed[z]
+            if slice_2d.any():
+                filled = binary_fill_holes(slice_2d)
+                intracranial[z] = filled & ~bone_mask[z]
+            else:
+                intracranial[z] = False
+
+        # Keep only the largest connected component (the brain cavity)
+        labeled, n_comps = label(intracranial)
+        if n_comps > 1:
+            comp_sizes = np.bincount(labeled.ravel())
+            comp_sizes[0] = 0
+            largest = comp_sizes.argmax()
+            intracranial = labeled == largest
+
+        # Dilate slightly to recapture tissue at the brain surface
+        intracranial = binary_dilation(intracranial, structure=struct_3d, iterations=1)
+
+        # Erode to pull away from inner skull table
+        erode_r = max(1, int(round(BRAIN_MASK_EROSION_MM / voxel_size_mm)))
+        brain_mask = binary_erosion(intracranial, structure=struct_3d, iterations=erode_r)
+
+        # Fallback: if erosion removed everything, use uneroded version
+        if not brain_mask.any():
+            brain_mask = intracranial
+
+        return brain_mask.astype(bool)
+
     def _prepare_volume(self, session_data: Any):
         """Convert HU arrays to multi-window RGB volume + tissue mask at 224^3."""
         from scipy.ndimage import binary_opening, zoom
@@ -310,8 +384,18 @@ class DINOv2CoDeGraphService:
         tissue_mask = (hu_vol > TISSUE_HU_LOW) & (hu_vol < TISSUE_HU_HIGH)
         tissue_mask = binary_opening(tissue_mask, iterations=2)
 
-        # Isotropic resampling before going to 224³
+        # Skull-stripping: restrict to intracranial contents only
         spacings = self._get_volume_spacings(session_data)
+        voxel_mm = float(np.mean(spacings))
+        brain_mask = self._extract_brain_mask(hu_vol, voxel_size_mm=voxel_mm)
+        n_before = tissue_mask.sum()
+        tissue_mask = tissue_mask & brain_mask
+        n_after = tissue_mask.sum()
+        logger.info("Skull-stripping: %d -> %d tissue voxels (removed %d extracranial, %.1f%%)",
+                     n_before, n_after, n_before - n_after,
+                     (n_before - n_after) / max(n_before, 1) * 100)
+
+        # Isotropic resampling before going to 224³
         s_iso = min(spacings)
         max_phys = max(d * s for d, s in zip(orig_shape, spacings))
         s_iso = max(s_iso, max_phys / (TARGET_SIZE * 2))
@@ -587,6 +671,53 @@ class DINOv2CoDeGraphService:
             logger.info("DIAG [Layer %d, 768-dim]: NN=%.3f, SN=%.3f, gap=%.4f → %s",
                          layer_idx, nn_med, sn_med, gap, verdict)
 
+    # -- Hemispheric asymmetry --------------------------------------------------
+
+    @staticmethod
+    def _compute_asymmetry(hu_grid_flat: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+        """Compute left-right HU asymmetry on the 16^3 grid.
+
+        For each voxel at (z, y, x), compare its HU to the mirror voxel at
+        (z, y, GRID_DIM-1-x). Unilateral lesions (hemorrhage) produce high
+        asymmetry; bilateral structures (ventricles) produce low asymmetry.
+
+        Returns per-voxel asymmetry scores normalized to [0, 1].
+        """
+        hu_grid = hu_grid_flat.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
+        valid_3d = valid_mask.reshape(GRID_DIM, GRID_DIM, GRID_DIM)
+
+        # Mirror along X axis (left-right)
+        hu_mirror = hu_grid[:, :, ::-1].copy()
+        valid_mirror = valid_3d[:, :, ::-1].copy()
+
+        # Both voxel and its mirror must be valid
+        both_valid = valid_3d & valid_mirror
+
+        # Raw asymmetry = absolute HU difference with contralateral side
+        raw_asym = np.abs(hu_grid - hu_mirror)
+        raw_asym[~both_valid] = 0.0
+
+        # Normalize by MAD of the valid asymmetries
+        valid_vals = raw_asym[both_valid]
+        if len(valid_vals) < 10:
+            return np.zeros_like(hu_grid_flat)
+
+        med = float(np.median(valid_vals))
+        mad = float(np.median(np.abs(valid_vals - med)))
+        sigma = mad * 1.4826
+        if sigma < 1e-4:
+            sigma = 1e-4
+
+        # Z-score of asymmetry, clipped to [0, 1]
+        asym_z = np.clip((raw_asym - med) / sigma, 0.0, 5.0) / 5.0
+        asym_z[~both_valid] = 0.0
+
+        n_asym = int((asym_z > 0.2).sum())
+        logger.info("Asymmetry: median=%.1f HU, σ=%.1f, %d voxels with asym>0.2",
+                     med, sigma, n_asym)
+
+        return asym_z.reshape(-1).astype(np.float32)
+
     # -- SCGAD scoring ----------------------------------------------------------
 
     def _scgad_scoring(
@@ -827,9 +958,12 @@ class DINOv2CoDeGraphService:
     ) -> np.ndarray:
         """Score voxels by component contrast to background.
 
-        Uses DUAL z-scoring: feature distance AND HU deviation.
-        The max of the two z-scores is used — so a hemorrhage that is
-        feature-similar to parenchyma but HU-different will still score.
+        Uses DIRECTIONAL dual z-scoring:
+        - Feature z-score: cosine distance to background centroid
+        - HU z-score: only HYPER-dense deviations (hemorrhage direction)
+        - CSF (<20 HU): features only — hypo-dense is normal anatomy
+        - Hemorrhage (>45 HU): max(feat_z, hu_z) — either signal suffices
+        - HU fallback: only flags hyper-dense outliers in background
         """
         n = tokens.shape[0]
         scores = np.zeros(n, dtype=np.float32)
@@ -901,16 +1035,28 @@ class DINOv2CoDeGraphService:
             d_k = 1.0 - float(comp_centroid_n @ bg_centroid_n)
             feat_z = max(0.0, (d_k - bg_feat_median) / bg_feat_sigma)
 
-            # HU z-score: absolute HU deviation from background median
+            # HU z-score: directional — only HYPER-dense deviations count
+            # CSF (5-15 HU) is hypo-dense but NORMAL anatomy → ignore
+            # Hemorrhage (50-90 HU) is hyper-dense and pathological → catch
             hu_z = 0.0
             comp_hu_mean = 0.0
             if has_hu:
                 comp_hu_mean = float(np.mean(hu_values[comp]))
-                hu_z = abs(comp_hu_mean - bg_hu_median) / bg_hu_sigma
+                hu_delta = comp_hu_mean - bg_hu_median
+                if hu_delta > 0:
+                    hu_z = hu_delta / bg_hu_sigma
+                # hypo-dense: hu_z stays 0 (CSF, edema = normal anatomy)
 
-            # Combined z-score: max of feature and HU signals
-            # Either signal alone is sufficient to flag the component
-            z_combined = max(feat_z, hu_z)
+            # Combined z-score: conditional on HU range
+            # Hemorrhage range (>45 HU): HU signal alone is sufficient
+            # CSF range (<20 HU): features only — HU deviation is expected
+            # Middle range: features + mild HU boost
+            if has_hu and comp_hu_mean > 45:
+                z_combined = max(feat_z, hu_z)
+            elif has_hu and comp_hu_mean < CSF_HU_HIGH:
+                z_combined = feat_z
+            else:
+                z_combined = feat_z + 0.3 * hu_z
 
             # Size sigmoid
             w_k = 1.0 / (1.0 + np.exp(-SIZE_SIGMOID_ALPHA * (comp_size - SIZE_SIGMOID_GAMMA)))
@@ -976,12 +1122,9 @@ class DINOv2CoDeGraphService:
                         for v in cluster:
                             scores[v] = max_score
 
-        # Step 6: HU outlier fallback — catches lesions trapped in background
-        # When DINOv2 features fail to separate hemorrhage from parenchyma,
-        # the graph keeps them connected in one big component. This step
-        # scans the background for voxels whose HU deviates significantly
-        # from the background distribution, clusters them spatially, and
-        # scores the clusters. This is the safety net.
+        # Step 6: HU outlier fallback — catches HYPER-DENSE lesions trapped in background
+        # Only flags voxels ABOVE background median (hemorrhage direction).
+        # CSF/ventricles are hypo-dense but normal → excluded.
         if has_hu and edges is not None:
             bg_hu_vals = hu_values[bg_indices]
             bg_hu_med = float(np.median(bg_hu_vals))
@@ -990,13 +1133,14 @@ class DINOv2CoDeGraphService:
             if bg_hu_sig < 1e-4:
                 bg_hu_sig = 1e-4
 
-            # Find HU outliers in background (|z| > 2.0)
+            # Find HYPER-dense HU outliers only (above background median)
             bg_set = set(bg_indices)
             outlier_voxels = set()
             for v in bg_indices:
-                hz = abs(hu_values[v] - bg_hu_med) / bg_hu_sig
-                if hz > 2.0:
-                    outlier_voxels.add(v)
+                if hu_values[v] > bg_hu_med:
+                    hz = (hu_values[v] - bg_hu_med) / bg_hu_sig
+                    if hz > 2.0:
+                        outlier_voxels.add(v)
 
             if len(outlier_voxels) >= MIN_ROI_GRID_VOXELS:
                 # Cluster outliers by spatial adjacency (reuse edges)
